@@ -25,6 +25,15 @@
             dest: "{{ ansible_env.APPDATA }}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\kafl_target.lnk"
       when: target_harness == 'userspace'
 
+    - name: Setup unpack harness target
+      block:
+        - name: Setup unpack harness to run at user login
+          win_shortcut:
+            src: "{{ ansible_env.USERPROFILE }}\\Desktop\\bin\\userspace\\unpack_harness.exe"
+            arguments: "{{ ansible_env.USERPROFILE }}\\Desktop\\bin\\userspace\\target_packed.exe 5000 0"
+            dest: "{{ ansible_env.APPDATA }}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\kafl_target.lnk"
+      when: target_harness == 'unpack'
+
     - name: Setup driver harness target
       block:
         - name: Upload vuln driver sources

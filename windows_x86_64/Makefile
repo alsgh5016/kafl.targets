@@ -15,12 +15,18 @@ init:
 
 compile:
 	mkdir -p bin/{userspace,driver}
-	x86_64-w64-mingw32-gcc src/userspace/selffuzz_test.c -I ../ -o bin/userspace/selffuzz_test.exe -Wall -mwindows 
+	# x86_64-w64-mingw32-gcc src/userspace/selffuzz_test.c -I ../ -o bin/userspace/selffuzz_test.exe -Wall -mwindows 
+	x86_64-w64-mingw32-gcc src/userspace/unpack_harness.c -I ../ -o bin/userspace/unpack_harness.exe -Wall -O2 -DWIN32 -D_WIN32_WINNT=0x0601 -lpsapi -lntdll -mwindows
 	x86_64-w64-mingw32-gcc src/driver/vuln_test.c -I ../ -o bin/driver/vuln_test.exe -Wall -lntdll -lpsapi
 
 provision_userspace: compile ansible
 	vagrant snapshot restore 'ready_provision'
 	TARGET_HARNESS='userspace' vagrant provision
+	vagrant halt
+
+provision_unpack: compile ansible
+	vagrant snapshot restore 'ready_provision'
+	TARGET_HARNESS='unpack' vagrant provision
 	vagrant halt
 
 provision_driver: compile ansible
