@@ -246,8 +246,8 @@ void setup_api_hooks(void) {
      */
     
     /* 32-bit 타겟의 kernel32.dll / ntdll.dll 베이스 주소 찾기 */
-    DWORD k32_base = find_module_base_32(g_target.hProcess, g_target.pid, "kernel32.dll");
-    DWORD ntdll_base = find_module_base_32(g_target.hProcess, g_target.pid, "ntdll.dll");
+    DWORD k32_base = find_module_base_32(g_target.process, g_target.pid, "kernel32.dll");
+    DWORD ntdll_base = find_module_base_32(g_target.process, g_target.pid, "ntdll.dll");
     
     if (!k32_base || !ntdll_base) {
         hprintf("[-] Failed to find 32-bit DLL bases. Skipping API hooks.\n");
@@ -280,7 +280,7 @@ void setup_api_hooks(void) {
     hook_data.num_hooks = 0;
     
     for (int i = 0; i < num_targets && i < MAX_API_HOOKS; i++) {
-        DWORD addr = find_export_in_remote_32(g_target.hProcess, targets[i].dll_base, targets[i].func_name);
+        DWORD addr = find_export_in_remote_32(g_target.process, targets[i].dll_base, targets[i].func_name);
         if (addr) {
             hprintf("[+] Hook target: %s!%s @ 0x%08x (32-bit)\n", 
                     targets[i].dll_name, targets[i].func_name, addr);
@@ -391,7 +391,6 @@ BOOL parse_pe_headers(HANDLE hProcess, UINT64 base_addr) {
     
     DWORD entry_point_rva;
     WORD num_sections;
-    PIMAGE_SECTION_HEADER section;
     
     if (pe_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
         /* 32-bit PE */
