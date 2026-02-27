@@ -391,6 +391,7 @@ BOOL parse_pe_headers(HANDLE hProcess, UINT64 base_addr) {
     
     DWORD entry_point_rva;
     WORD num_sections;
+    PIMAGE_SECTION_HEADER section;
     
     if (pe_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
         /* 32-bit PE */
@@ -424,7 +425,7 @@ BOOL parse_pe_headers(HANDLE hProcess, UINT64 base_addr) {
     hprintf("[+] Entry point: 0x%llx\n", g_target.entry_point);
     
     /* Parse sections */
-    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(nt_headers);
+    section = IMAGE_FIRST_SECTION(nt_headers);
     g_target.section_count = nt_headers->FileHeader.NumberOfSections;
     
     hprintf("[+] Found %d sections:\n", g_target.section_count);
