@@ -118,11 +118,180 @@ void set_ip_range_usermode(UINT64 base, UINT64 size, int index) {
 }
 
 /*
+ * 32-bit 타겟 프로세스에서 DLL 베이스 주소를 찾는 함수
+ */
+DWORD find_module_base_32(HANDLE hProcess, DWORD pid, const char* module_name) {
+    MODULEENTRY32 me32;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        hprintf("[-] CreateToolhelp32Snapshot failed: 0x%X\n", GetLastError());
+        return 0;
+    }
+    
+    me32.dwSize = sizeof(MODULEENTRY32);
+    if (!Module32First(hSnap, &me32)) {
+        CloseHandle(hSnap);
+        return 0;
+    }
+    
+    do {
+        if (_stricmp(me32.szModule, module_name) == 0) {
+            DWORD base = (DWORD)(UINT_PTR)me32.modBaseAddr;
+            hprintf("[+] Found 32-bit %s at 0x%08x (size: 0x%x)\n", 
+                    module_name, base, me32.modBaseSize);
+            CloseHandle(hSnap);
+            return base;
+        }
+    } while (Module32Next(hSnap, &me32));
+    
+    CloseHandle(hSnap);
+    hprintf("[-] Module %s not found in 32-bit process\n", module_name);
+    return 0;
+}
+
+/*
+ * 32-bit PE의 Export Table을 파싱해서 함수 주소를 찾는 함수
+ * hProcess: 타겟 프로세스 핸들
+ * dll_base: DLL의 베이스 주소 (32-bit)
+ * func_name: 찾을 함수 이름
+ */
+DWORD find_export_in_remote_32(HANDLE hProcess, DWORD dll_base, const char* func_name) {
+    BYTE header[4096];
+    SIZE_T br;
+    
+    if (!ReadProcessMemory(hProcess, (LPCVOID)(UINT_PTR)dll_base, header, sizeof(header), &br)) {
+        hprintf("[-] Failed to read DLL header at 0x%08x\n", dll_base);
+        return 0;
+    }
+    
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)header;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    
+    /* 32-bit PE: IMAGE_NT_HEADERS32 */
+    PIMAGE_NT_HEADERS32 nt = (PIMAGE_NT_HEADERS32)(header + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        hprintf("[-] Not a 32-bit PE (magic: 0x%x)\n", nt->OptionalHeader.Magic);
+        return 0;
+    }
+    
+    DWORD export_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD export_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (export_rva == 0) return 0;
+    
+    /* Export Directory 읽기 */
+    BYTE* export_buf = (BYTE*)VirtualAlloc(NULL, export_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!export_buf) return 0;
+    
+    if (!ReadProcessMemory(hProcess, (LPCVOID)(UINT_PTR)(dll_base + export_rva), 
+                           export_buf, export_size, &br)) {
+        VirtualFree(export_buf, 0, MEM_RELEASE);
+        return 0;
+    }
+    
+    PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)export_buf;
+    
+    /* Name, Ordinal, Function 테이블의 RVA (export directory 기준으로 offset 계산) */
+    DWORD names_rva = exports->AddressOfNames;
+    DWORD ordinals_rva = exports->AddressOfNameOrdinals;
+    DWORD functions_rva = exports->AddressOfFunctions;
+    
+    /* 각 테이블을 읽기 */
+    DWORD num_names = exports->NumberOfNames;
+    DWORD* name_rvas = (DWORD*)VirtualAlloc(NULL, num_names * 4, MEM_COMMIT, PAGE_READWRITE);
+    WORD* ordinals = (WORD*)VirtualAlloc(NULL, num_names * 2, MEM_COMMIT, PAGE_READWRITE);
+    DWORD num_funcs = exports->NumberOfFunctions;
+    DWORD* func_rvas = (DWORD*)VirtualAlloc(NULL, num_funcs * 4, MEM_COMMIT, PAGE_READWRITE);
+    
+    ReadProcessMemory(hProcess, (LPCVOID)(UINT_PTR)(dll_base + names_rva), 
+                      name_rvas, num_names * 4, &br);
+    ReadProcessMemory(hProcess, (LPCVOID)(UINT_PTR)(dll_base + ordinals_rva), 
+                      ordinals, num_names * 2, &br);
+    ReadProcessMemory(hProcess, (LPCVOID)(UINT_PTR)(dll_base + functions_rva), 
+                      func_rvas, num_funcs * 4, &br);
+    
+    DWORD result = 0;
+    char name_buf[256];
+    
+    for (DWORD i = 0; i < num_names; i++) {
+        if (ReadProcessMemory(hProcess, (LPCVOID)(UINT_PTR)(dll_base + name_rvas[i]), 
+                              name_buf, sizeof(name_buf), &br)) {
+            name_buf[255] = '\0';
+            if (strcmp(name_buf, func_name) == 0) {
+                WORD ordinal = ordinals[i];
+                result = dll_base + func_rvas[ordinal];
+                break;
+            }
+        }
+    }
+    
+    VirtualFree(name_rvas, 0, MEM_RELEASE);
+    VirtualFree(ordinals, 0, MEM_RELEASE);
+    VirtualFree(func_rvas, 0, MEM_RELEASE);
+    VirtualFree(export_buf, 0, MEM_RELEASE);
+    
+    return result;
+}
+
+/*
  * Resolve and submit Windows API addresses for hook-based detection.
  * System DLLs share the same base address across all processes in a
  * boot session, so our own GetProcAddress results are valid for the child.
  */
 void setup_api_hooks(void) {
+    /* 
+     * 중요: 프로세스가 SUSPENDED 상태에서는 DLL이 아직 로드 안 되었을 수 있음!
+     * ResumeThread → Sleep → SuspendThread 후, 또는 NtResumeProcess 후 호출해야 함
+     * 또는 CreateProcess 이후 프로세스 초기화가 완료된 시점에 호출
+     */
+    
+    /* 32-bit 타겟의 kernel32.dll / ntdll.dll 베이스 주소 찾기 */
+    DWORD k32_base = find_module_base_32(hProcess, pid, "kernel32.dll");
+    DWORD ntdll_base = find_module_base_32(hProcess, pid, "ntdll.dll");
+    
+    if (!k32_base || !ntdll_base) {
+        hprintf("[-] Failed to find 32-bit DLL bases. Skipping API hooks.\n");
+        return;
+    }
+    
+    /* 32-bit Export Table에서 함수 주소 추출 */
+    typedef struct {
+        const char* dll_name;
+        DWORD dll_base;
+        const char* func_name;
+    } hook_target_t;
+    
+    hook_target_t targets[] = {
+        {"kernel32.dll", k32_base, "GetProcAddress"},
+        {"kernel32.dll", k32_base, "VirtualAlloc"},
+        {"kernel32.dll", k32_base, "VirtualProtect"},
+        {"kernel32.dll", k32_base, "WriteProcessMemory"},
+        {"kernel32.dll", k32_base, "LoadLibraryA"},
+        {"kernel32.dll", k32_base, "LoadLibraryW"},
+        {"ntdll.dll",    ntdll_base, "NtProtectVirtualMemory"},
+        {"ntdll.dll",    ntdll_base, "NtWriteVirtualMemory"},
+    };
+    
+    int num_targets = sizeof(targets) / sizeof(targets[0]);
+    
+    for (int i = 0; i < num_targets; i++) {
+        DWORD addr = find_export_in_remote_32(hProcess, targets[i].dll_base, targets[i].func_name);
+        if (addr) {
+            hprintf("[+] Hook target: %s!%s @ 0x%08x (32-bit)\n", 
+                    targets[i].dll_name, targets[i].func_name, addr);
+            
+            /* hypercall로 hook 설치 */
+            volatile kafl_api_hook_t hook_data __attribute__((aligned(4096)));
+            hook_data.target_address = (uint64_t)addr;  /* 32-bit 주소 (0x76xxxxxx 등) */
+            hook_data.hook_type = 0;
+            
+            kAFL_hypercall(HYPERCALL_KAFL_HOOK_API, (uintptr_t)&hook_data);
+        } else {
+            hprintf("[-] Failed to resolve %s!%s\n", 
+                    targets[i].dll_name, targets[i].func_name);
+        }
+    }
+    /*
     static kafl_api_hook_t hook_data __attribute__((aligned(4096)));
     memset(&hook_data, 0, sizeof(hook_data));
     struct {
@@ -167,6 +336,7 @@ void setup_api_hooks(void) {
     } else {
         hprintf("[-] No API hooks resolved\n");
     }
+    */
 }
 
 /*
@@ -205,6 +375,38 @@ BOOL parse_pe_headers(HANDLE hProcess, UINT64 base_addr) {
     PIMAGE_NT_HEADERS64 nt_headers = (PIMAGE_NT_HEADERS64)(header_buffer + dos_header->e_lfanew);
     if (nt_headers->Signature != IMAGE_NT_SIGNATURE) {
         hprintf("[-] Invalid NT signature\n");
+        return FALSE;
+    }
+    
+    /* Magic으로 32/64-bit 판별 */
+    WORD pe_magic = *(WORD*)(header_buffer + dos_header->e_lfanew + 
+                             sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER));
+    
+    DWORD entry_point_rva;
+    WORD num_sections;
+    PIMAGE_SECTION_HEADER section;
+    
+    if (pe_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        /* 32-bit PE */
+        hprintf("[+] Detected 32-bit PE\n");
+        PIMAGE_NT_HEADERS32 nt32 = (PIMAGE_NT_HEADERS32)(header_buffer + dos_header->e_lfanew);
+        if (nt32->Signature != IMAGE_NT_SIGNATURE) return FALSE;
+        
+        entry_point_rva = nt32->OptionalHeader.AddressOfEntryPoint;
+        num_sections = nt32->FileHeader.NumberOfSections;
+        section = (PIMAGE_SECTION_HEADER)((BYTE*)&nt32->OptionalHeader + 
+                   nt32->FileHeader.SizeOfOptionalHeader);
+    } else if (pe_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        /* 64-bit PE */
+        hprintf("[+] Detected 64-bit PE\n");
+        PIMAGE_NT_HEADERS64 nt64 = (PIMAGE_NT_HEADERS64)(header_buffer + dos_header->e_lfanew);
+        if (nt64->Signature != IMAGE_NT_SIGNATURE) return FALSE;
+        
+        entry_point_rva = nt64->OptionalHeader.AddressOfEntryPoint;
+        num_sections = nt64->FileHeader.NumberOfSections;
+        section = IMAGE_FIRST_SECTION(nt64);
+    } else {
+        hprintf("[-] Unknown PE magic: 0x%x\n", pe_magic);
         return FALSE;
     }
     
