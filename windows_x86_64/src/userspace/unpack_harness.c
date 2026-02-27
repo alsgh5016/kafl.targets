@@ -118,6 +118,58 @@ void set_ip_range_usermode(UINT64 base, UINT64 size, int index) {
 }
 
 /*
+ * Resolve and submit Windows API addresses for hook-based detection.
+ * System DLLs share the same base address across all processes in a
+ * boot session, so our own GetProcAddress results are valid for the child.
+ */
+void setup_api_hooks(void) {
+    static kafl_api_hook_t hook_data __attribute__((aligned(4096)));
+    memset(&hook_data, 0, sizeof(hook_data));
+    struct {
+        const char *dll;
+        const char *func;
+    } apis[] = {
+        {"kernel32.dll", "GetProcAddress"},
+        {"kernel32.dll", "VirtualAlloc"},
+        {"kernel32.dll", "VirtualProtect"},
+        {"kernel32.dll", "WriteProcessMemory"},
+        {"kernel32.dll", "LoadLibraryA"},
+        {"kernel32.dll", "LoadLibraryW"},
+        {"ntdll.dll",    "NtProtectVirtualMemory"},
+        {"ntdll.dll",    "NtWriteVirtualMemory"},
+    };
+    int count = sizeof(apis) / sizeof(apis[0]);
+    int valid = 0;
+    for (int i = 0; i < count && valid < MAX_API_HOOKS; i++) {
+        HMODULE mod = GetModuleHandleA(apis[i].dll);
+        if (!mod) {
+            mod = LoadLibraryA(apis[i].dll);
+        }
+        if (!mod) {
+            hprintf("[-] Cannot load %s\n", apis[i].dll);
+            continue;
+        }
+        FARPROC addr = GetProcAddress(mod, apis[i].func);
+        if (!addr) {
+            hprintf("[-] Cannot find %s!%s\n", apis[i].dll, apis[i].func);
+            continue;
+        }
+        hook_data.addresses[valid] = (uint64_t)addr;
+        snprintf(hook_data.names[valid], 64, "%s!%s", apis[i].dll, apis[i].func);
+        hprintf("[+] Hook: %s @ 0x%llx\n", hook_data.names[valid], (uint64_t)addr);
+        valid++;
+    }
+    hook_data.num_hooks = valid;
+    if (valid > 0) {
+        hprintf("[+] Submitting %d API hooks to hypervisor...\n", valid);
+        kAFL_hypercall(HYPERCALL_KAFL_HOOK_API, (uintptr_t)&hook_data);
+        hprintf("[+] API hooks installed\n");
+    } else {
+        hprintf("[-] No API hooks resolved\n");
+    }
+}
+
+/*
  * Dump memory region to host filesystem via hypercall
  */
 void dump_memory_to_host(const char* filename, LPVOID data, SIZE_T size) {
@@ -482,6 +534,9 @@ int main(int argc, char** argv) {
     /* This avoids anti-debug detection by VMProtect */
     
     hprintf("[+] Starting Intel PT tracing...\n");
+    
+    /* Install API hooks before starting trace */
+    setup_api_hooks();
     
     /* Start tracing */
     kAFL_hypercall(HYPERCALL_KAFL_ACQUIRE, 0);
