@@ -50,6 +50,7 @@ typedef struct {
     UINT64 image_base;
     UINT64 entry_point;
     UINT64 original_entry_point;  /* OEP - detected during unpacking */
+    UINT64 size_of_image;
     section_info_t sections[64];
     int section_count;
 } target_process_t;
@@ -157,6 +158,7 @@ BOOL parse_pe_headers(HANDLE hProcess, UINT64 base_addr) {
     
     g_target.image_base = base_addr;
     g_target.entry_point = base_addr + nt_headers->OptionalHeader.AddressOfEntryPoint;
+    g_target.size_of_image = nt_headers->OptionalHeader.SizeOfImage;
     
     hprintf("[+] Image base: 0x%llx\n", g_target.image_base);
     hprintf("[+] Entry point: 0x%llx\n", g_target.entry_point);
@@ -410,7 +412,7 @@ int main(int argc, char** argv) {
             }
         }
     }
-
+#if 0
     /* Submit child process CR3 for Intel PT filtering via vmcall injection */
     hprintf("[+] Submitting child process CR3 via vmcall injection...\n");
     {
@@ -460,19 +462,20 @@ int main(int argc, char** argv) {
         VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
         hprintf("[+] Child CR3 submitted successfully\n");
     }
+#endif
     
     /* Set IP range for Intel PT to cover unpacking stub and OEP */
     /* Range 0: Entire image for now (packer + unpacked code) */
-    if (g_target.image_base && g_target.section_count > 0) {
-        UINT64 total_size = 0;
-        for (int i = 0; i < g_target.section_count; i++) {
-            UINT64 section_end = g_target.sections[i].base_address + 
-                                g_target.sections[i].size - g_target.image_base;
-            if (section_end > total_size) {
-                total_size = section_end;
-            }
+    if (g_target.image_base && g_target.size_of_image > 0) {
+        set_ip_range_usermode(g_target.image_base, g_target.size_of_image, 0);
+        
+        /* Verify entry point is with in IP range */
+        if (g_target.entry_point < g_target.image_base || 
+            g_target.entry_point >= g_target.image_base + g_target.size_of_image) {
+            hprintf("[!] WARNING: Entry point 0x%llx is outside IP range 0x%llx - 0x%llx\n",
+                    g_target.entry_point, g_target.image_base,
+                    g_target.image_base + g_target.size_of_image);
         }
-        set_ip_range_usermode(g_target.image_base, total_size, 0);
     }
     
     /* No debug detach needed - we don't use DEBUG_PROCESS */
