@@ -72,7 +72,7 @@ void init_agent_handshake(void) {
     kAFL_hypercall(HYPERCALL_KAFL_RELEASE, 0);
 
     /* Submit our CR3 */
-    kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0);
+    // kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0);
 
     /* Tell kAFL we're running in 64bit mode */
     kAFL_hypercall(HYPERCALL_KAFL_USER_SUBMIT_MODE, KAFL_MODE_64);
