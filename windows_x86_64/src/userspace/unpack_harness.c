@@ -246,8 +246,8 @@ void setup_api_hooks(void) {
      */
     
     /* 32-bit 타겟의 kernel32.dll / ntdll.dll 베이스 주소 찾기 */
-    DWORD k32_base = find_module_base_32(hProcess, pid, "kernel32.dll");
-    DWORD ntdll_base = find_module_base_32(hProcess, pid, "ntdll.dll");
+    DWORD k32_base = find_module_base_32(g_target.hProcess, g_target.pid, "kernel32.dll");
+    DWORD ntdll_base = find_module_base_32(g_target.hProcess, g_target.pid, "ntdll.dll");
     
     if (!k32_base || !ntdll_base) {
         hprintf("[-] Failed to find 32-bit DLL bases. Skipping API hooks.\n");
@@ -274,22 +274,29 @@ void setup_api_hooks(void) {
     
     int num_targets = sizeof(targets) / sizeof(targets[0]);
     
-    for (int i = 0; i < num_targets; i++) {
-        DWORD addr = find_export_in_remote_32(hProcess, targets[i].dll_base, targets[i].func_name);
+    /* 하나의 struct에 모든 hook을 채움 */
+    static kafl_api_hook_t hook_data __attribute__((aligned(4096)));
+    memset((void*)&hook_data, 0, sizeof(hook_data));
+    hook_data.num_hooks = 0;
+    
+    for (int i = 0; i < num_targets && i < MAX_API_HOOKS; i++) {
+        DWORD addr = find_export_in_remote_32(g_target.hProcess, targets[i].dll_base, targets[i].func_name);
         if (addr) {
             hprintf("[+] Hook target: %s!%s @ 0x%08x (32-bit)\n", 
                     targets[i].dll_name, targets[i].func_name, addr);
-            
-            /* hypercall로 hook 설치 */
-            volatile kafl_api_hook_t hook_data __attribute__((aligned(4096)));
-            hook_data.target_address = (uint64_t)addr;  /* 32-bit 주소 (0x76xxxxxx 등) */
-            hook_data.hook_type = 0;
-            
-            kAFL_hypercall(HYPERCALL_KAFL_HOOK_API, (uintptr_t)&hook_data);
+            hook_data.addresses[hook_data.num_hooks] = (uint64_t)addr;
+            snprintf((char*)hook_data.names[hook_data.num_hooks], 64, "%s!%s",
+                     targets[i].dll_name, targets[i].func_name);
+            hook_data.num_hooks++;
         } else {
             hprintf("[-] Failed to resolve %s!%s\n", 
                     targets[i].dll_name, targets[i].func_name);
         }
+    }
+    
+    if (hook_data.num_hooks > 0) {
+        hprintf("[+] Installing %llu API hooks via hypercall...\n", hook_data.num_hooks);
+        kAFL_hypercall(HYPERCALL_KAFL_HOOK_API, (uintptr_t)&hook_data);
     }
     /*
     static kafl_api_hook_t hook_data __attribute__((aligned(4096)));
