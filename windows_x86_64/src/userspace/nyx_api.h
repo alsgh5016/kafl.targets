@@ -79,6 +79,7 @@
 
 #define HYPERCALL_KAFL_REQ_STREAM_DATA_BULK 38
 #define HYPERCALL_KAFL_PERSIST_PAGE_PAST_SNAPSHOT 39
+#define HYPERCALL_KAFL_HOOK_API             40
 
 /* hypertrash only hypercalls */
 #define HYPERTRASH_HYPERCALL_MASK			0xAA000000
@@ -185,5 +186,12 @@ typedef struct {
 	uint64_t num_addresses;
 	uint64_t addresses[479];
 } __attribute__((packed)) req_data_bulk_t;
+
+#define MAX_API_HOOKS 16
+typedef struct {
+    uint64_t num_hooks;
+    uint64_t addresses[MAX_API_HOOKS];
+    char     names[MAX_API_HOOKS][64];
+} __attribute__((packed)) kafl_api_hook_t;
 
 #endif /* NYX_API_H */
