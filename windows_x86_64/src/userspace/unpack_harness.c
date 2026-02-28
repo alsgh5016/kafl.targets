@@ -299,7 +299,7 @@ void setup_api_hooks(void) {
         {"kernel32.dll",   k32_base,   "GetProcAddress"},
         {"KernelBase.dll", kb_base,    "VirtualAlloc"},
         {"KernelBase.dll", kb_base,    "VirtualProtect"},
-        {"kernel32.dll",   k32_base,   "WriteProcessMemory"},
+        // WriteProcessMemory removed - covered by NtWriteVirtualMemory (ntdll level)
         {"kernel32.dll",   k32_base,   "LoadLibraryA"},
         {"kernel32.dll",   k32_base,   "LoadLibraryW"},
         {"ntdll.dll",      ntdll_base, "NtProtectVirtualMemory"},
