@@ -693,7 +693,7 @@ int main(int argc, char** argv) {
             if (!parse_pe_headers(pi.hProcess, image_base)) {
                 hprintf("[-] Failed to parse PE headers\n");
             }
-        }
+    }
     
     /* Wait for target to initialize (ntdll Ldr to load kernel32.dll) */
     /* We resume, wait, and suspend to allow Ldr to do its job */
