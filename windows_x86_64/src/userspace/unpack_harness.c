@@ -158,14 +158,21 @@ DWORD find_module_base_32(HANDLE hProcess, DWORD pid, const char* module_name) {
     
     do {
         if (_stricmp(me32.szModule, module_name) == 0) {
-            DWORD base = (DWORD)(UINT_PTR)me32.modBaseAddr;
-            hprintf("[+] Found 32-bit %s at 0x%08x (size: 0x%x)\n", 
-                    module_name, base, me32.modBaseSize);
-            CloseHandle(hSnap);
-            return base;
+            // Check if it's a 32-bit module. Since the harness is 64-bit and the target is WOW64 (32-bit),
+            // CreateToolhelp32Snapshot returns both 64-bit and 32-bit modules.
+            // The 64-bit ntdll.dll is loaded at a 64-bit address (> 0xFFFFFFFF), 
+            // so we skip it to find the 32-bit ntdll.dll.
+            if ((UINT_PTR)me32.modBaseAddr <= 0xFFFFFFFFULL) {
+                DWORD base = (DWORD)(UINT_PTR)me32.modBaseAddr;
+                hprintf("[+] Found 32-bit %s at 0x%08x (size: 0x%x)\n", 
+                        module_name, base, me32.modBaseSize);
+                CloseHandle(hSnap);
+                return base;
+            } else {
+                hprintf("[*] Skipping 64-bit %s at 0x%llx\n", module_name, (UINT64)me32.modBaseAddr);
+            }
         }
     } while (Module32Next(hSnap, &me32));
-    
     CloseHandle(hSnap);
     hprintf("[-] Module %s not found in 32-bit process\n", module_name);
     return 0;
