@@ -329,6 +329,21 @@ void setup_api_hooks(void) {
     }
     
     if (hook_data.num_hooks > 0) {
+        /* Page touch: force demand paging before BP install */
+        hprintf("[+] Touching %llu pages to force loading...\n", hook_data.num_hooks);
+        for (uint64_t i = 0; i < hook_data.num_hooks; i++) {
+            volatile BYTE dummy = 0;
+            DWORD target_addr = (DWORD)hook_data.addresses[i];
+            SIZE_T bytes_read = 0;
+            if (ReadProcessMemory(g_target.process, (LPCVOID)(UINT_PTR)target_addr,
+                                  (LPVOID)&dummy, 1, &bytes_read)) {
+                hprintf("    [*] Page touched: 0x%08x (read 0x%02x)\n", target_addr, dummy);
+            } else {
+                hprintf("    [-] Page touch FAILED: 0x%08x (err=%lu)\n", 
+                        target_addr, GetLastError());
+            }
+        }
+        
         hprintf("[+] Installing %llu API hooks via hypercall...\n", hook_data.num_hooks);
         kAFL_hypercall(HYPERCALL_KAFL_HOOK_API, (uintptr_t)&hook_data);
     }
