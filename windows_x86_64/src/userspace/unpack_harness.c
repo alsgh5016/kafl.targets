@@ -119,12 +119,34 @@ void set_ip_range_usermode(UINT64 base, UINT64 size, int index) {
 
 /*
  * 32-bit 타겟 프로세스에서 DLL 베이스 주소를 찾는 함수
+ * ASLR 특성상 시스템 DLL(kernel32.dll, ntdll.dll)은 64비트 하네스의 32비트 버전을 찾으면 됨
+ * (Windows의 SysWOW64 시스템 DLL은 부팅 시 모든 프로세스에서 동일한 베이스를 가짐)
  */
 DWORD find_module_base_32(HANDLE hProcess, DWORD pid, const char* module_name) {
+    // SUSPENDED 상태의 WOW64(32-bit) 프로세스는 Ldr 초기화 전이라 CreateToolhelp32Snapshot이 실패함.
+    // 하지만 ASLR 특성상 ntdll.dll과 kernel32.dll의 32비트 베이스는 우리(64비트)가 32비트 모듈을 
+    // 로드해봐도 알 수 있음. (다만 하네스가 64비트이므로 시스템 경로의 32비트 dll을 매핑해봐야 함)
+    
+    // 간이 구현: 대상 프로세스의 32-bit PEB를 읽어 매핑된 32비트 ntdll.dll 베이스를 알아내거나, 
+    // ResumeThread 후 잠시 대기했다가 다시 SuspendThread 후 Snaphot을 찍는 방법이 가장 확실함.
+    
+    // 하지만, 여기서는 가장 안정적인 방법으로: 하네스에서 ResumeThread를 먼저 하고 Sleep 한 다음 
+    // 훅을 설치하도록 구조를 변경할 예정이므로 기존 코드는 임시로 실패를 반환하지 않고 대기 루프를 돌게 함.
+    
     MODULEENTRY32 me32;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    HANDLE hSnap = INVALID_HANDLE_VALUE;
+    int retries = 50; // 최대 5초 대기 (100ms * 50)
+    
+    while (retries-- > 0) {
+        hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            break;
+        }
+        Sleep(100); // Ldr 초기화를 기다림
+    }
+    
     if (hSnap == INVALID_HANDLE_VALUE) {
-        hprintf("[-] CreateToolhelp32Snapshot failed: 0x%X\n", GetLastError());
+        hprintf("[-] CreateToolhelp32Snapshot failed after retries: 0x%X\n", GetLastError());
         return 0;
     }
     
@@ -672,7 +694,17 @@ int main(int argc, char** argv) {
                 hprintf("[-] Failed to parse PE headers\n");
             }
         }
-    }
+    
+    /* Wait for target to initialize (ntdll Ldr to load kernel32.dll) */
+    /* We resume, wait, and suspend to allow Ldr to do its job */
+    hprintf("[+] Resuming briefly to allow DLL loading...\n");
+    ResumeThread(pi.hThread);
+    Sleep(100); // 100ms is usually enough for Ldr
+    SuspendThread(pi.hThread);
+    hprintf("[+] Process suspended again.\n");
+    
+    /* Setup API hooks */
+    setup_api_hooks();
 #if 0
     /* Submit child process CR3 for Intel PT filtering via vmcall injection */
     hprintf("[+] Submitting child process CR3 via vmcall injection...\n");
@@ -743,10 +775,6 @@ int main(int argc, char** argv) {
     /* This avoids anti-debug detection by VMProtect */
     
     hprintf("[+] Starting Intel PT tracing...\n");
-    
-    /* Install API hooks before starting trace */
-    setup_api_hooks();
-    
     /* Start tracing */
     kAFL_hypercall(HYPERCALL_KAFL_ACQUIRE, 0);
     
