@@ -644,7 +644,11 @@ int main(int argc, char** argv) {
     if (ext) *ext = '\0';
     
     hprintf("[+] Target: %s\n", target_exe);
-    hprintf("[+] Timeout: %d ms\n", g_timeout_ms);
+    if (g_timeout_ms == 0) {
+        hprintf("[+] Timeout: INFINITE (manual termination required)\n");
+    } else {
+        hprintf("[+] Timeout: %d ms\n", g_timeout_ms);
+    }
     hprintf("[+] Dump mode: %d\n", g_dump_mode);
     hprintf("[+] Output prefix: %s\n\n", g_output_prefix);
     
@@ -873,7 +877,8 @@ skip_injection:;
      * We wait for timeout to ensure unpacking is complete,
      * then dump the unpacked memory.
      */
-    DWORD wait_result = WaitForSingleObject(pi.hProcess, g_timeout_ms);
+    DWORD wait_timeout = (g_timeout_ms == 0) ? INFINITE : g_timeout_ms;
+    DWORD wait_result = WaitForSingleObject(pi.hProcess, wait_timeout);
     
     /* Stop tracing first */
     kAFL_hypercall(HYPERCALL_KAFL_RELEASE, 0);
