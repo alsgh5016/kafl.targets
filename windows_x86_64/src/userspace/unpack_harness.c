@@ -72,7 +72,7 @@ void init_agent_handshake(void) {
     kAFL_hypercall(HYPERCALL_KAFL_RELEASE, 0);
 
     /* Submit our CR3 */
-    // kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0);
+    kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0);
 
     /* Tell kAFL we're running in 64bit mode */
     kAFL_hypercall(HYPERCALL_KAFL_USER_SUBMIT_MODE, KAFL_MODE_64);
@@ -752,23 +752,85 @@ int main(int argc, char** argv) {
         BOOL isWow64 = FALSE;
         IsWow64Process(pi.hProcess, &isWow64);
         if (isWow64) {
-            hprintf("[-] WOW64 Target detected. 64-bit shellcode injection might fail. Falling back to harness CR3.\n");
-            kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0);
+            hprintf("[+] WOW64 Target detected. Using 32-bit shellcode for CR3 submission...\n");
             VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-            goto skip_injection;
+            
+            /*
+             * 32-bit shellcode for WOW64 process:
+             * vmcall(eax=0x1f, ebx=SUBMIT_CR3(5), ecx=0)
+             * QEMU-Nyx reads CR3 from vCPU when arg=0, capturing the 32-bit process's CR3.
+             */
+            BYTE cr3_shellcode_32[] = {
+                0xB8, 0x1F, 0x00, 0x00, 0x00,  /* mov eax, 0x1f */
+                0xBB, 0x05, 0x00, 0x00, 0x00,  /* mov ebx, 5 (SUBMIT_CR3) */
+                0xB9, 0x00, 0x00, 0x00, 0x00,  /* mov ecx, 0 */
+                0x0F, 0x01, 0xC1,              /* vmcall */
+                0xEB, 0xFE                     /* jmp $ (spin) */
+            };
+            
+            /* Allocate in low 4GB for 32-bit addressing */
+            sc_addr = VirtualAllocEx(pi.hProcess, NULL, sizeof(cr3_shellcode_32),
+                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!sc_addr) {
+                hprintf("[-] VirtualAllocEx for 32-bit shellcode failed: 0x%X\n", GetLastError());
+                habort("Failed to inject 32-bit CR3 shellcode\n");
+            }
+            
+            /* Verify address is in 32-bit range */
+            if ((UINT64)sc_addr > 0xFFFFFFFF) {
+                hprintf("[-] Shellcode allocated above 4GB (0x%llx), cannot use for WOW64\n", (UINT64)sc_addr);
+                VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
+                habort("32-bit shellcode address out of range\n");
+            }
+            
+            if (!WriteProcessMemory(pi.hProcess, sc_addr, cr3_shellcode_32,
+                                    sizeof(cr3_shellcode_32), NULL)) {
+                hprintf("[-] WriteProcessMemory for 32-bit shellcode failed: 0x%X\n", GetLastError());
+                VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
+                habort("Failed to write 32-bit CR3 shellcode\n");
+            }
+            
+            /* Use WOW64_CONTEXT for 32-bit thread manipulation */
+            WOW64_CONTEXT wow_ctx = {0};
+            wow_ctx.ContextFlags = WOW64_CONTEXT_FULL;
+            if (!Wow64GetThreadContext(pi.hThread, &wow_ctx)) {
+                hprintf("[-] Wow64GetThreadContext failed: 0x%X\n", GetLastError());
+                VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
+                habort("Failed to get WOW64 context\n");
+            }
+            
+            WOW64_CONTEXT orig_wow_ctx = wow_ctx;
+            wow_ctx.Eip = (DWORD)(UINT_PTR)sc_addr;
+            
+            if (!Wow64SetThreadContext(pi.hThread, &wow_ctx)) {
+                hprintf("[-] Wow64SetThreadContext failed: 0x%X\n", GetLastError());
+                VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
+                habort("Failed to set WOW64 context\n");
+            }
+            
+            /* Resume briefly to execute vmcall */
+            ResumeThread(pi.hThread);
+            Sleep(100);
+            SuspendThread(pi.hThread);
+            
+            /* Restore original context and cleanup */
+            Wow64SetThreadContext(pi.hThread, &orig_wow_ctx);
+            VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
+            hprintf("[+] WOW64 Child CR3 submitted successfully\n");
+        } else {
+            sc_ctx.Rip = (DWORD64)sc_addr;
+            SetThreadContext(pi.hThread, &sc_ctx);
+
+            /* Briefly resume to execute vmcall, then recapture */
+            ResumeThread(pi.hThread);
+            Sleep(100);
+            SuspendThread(pi.hThread);
+
+            /* Restore original context and free shellcode memory */
+            SetThreadContext(pi.hThread, &orig_ctx);
+            VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
+            hprintf("[+] Child CR3 submitted successfully\n");
         }
-        sc_ctx.Rip = (DWORD64)sc_addr;
-        SetThreadContext(pi.hThread, &sc_ctx);
-
-        /* Briefly resume to execute vmcall, then recapture */
-        ResumeThread(pi.hThread);
-        Sleep(100);
-        SuspendThread(pi.hThread);
-
-        /* Restore original context and free shellcode memory */
-        SetThreadContext(pi.hThread, &orig_ctx);
-        VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-        hprintf("[+] Child CR3 submitted successfully\n");
 skip_injection:;
     }
 #endif
