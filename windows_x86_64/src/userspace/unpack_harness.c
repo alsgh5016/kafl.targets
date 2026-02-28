@@ -711,9 +711,8 @@ int main(int argc, char** argv) {
     SuspendThread(pi.hThread);
     hprintf("[+] Process suspended again.\n");
     
-    /* Setup API hooks */
-    setup_api_hooks();
-#if 0
+    /* We will setup API hooks AFTER we submit the child's CR3 */
+#if 1
     /* Submit child process CR3 for Intel PT filtering via vmcall injection */
     hprintf("[+] Submitting child process CR3 via vmcall injection...\n");
     {
@@ -764,7 +763,9 @@ int main(int argc, char** argv) {
         hprintf("[+] Child CR3 submitted successfully\n");
     }
 #endif
-    
+
+    /* Setup API hooks AFTER child CR3 is submitted so QEMU uses correct CR3 */
+    setup_api_hooks();
     /* Set IP range for Intel PT to cover unpacking stub and OEP */
     /* Range 0: Entire image for now (packer + unpacked code) */
     if (g_target.image_base && g_target.size_of_image > 0) {
