@@ -749,6 +749,14 @@ int main(int argc, char** argv) {
         GetThreadContext(pi.hThread, &orig_ctx);
 
         CONTEXT sc_ctx = orig_ctx;
+        BOOL isWow64 = FALSE;
+        IsWow64Process(pi.hProcess, &isWow64);
+        if (isWow64) {
+            hprintf("[-] WOW64 Target detected. 64-bit shellcode injection might fail. Falling back to harness CR3.\n");
+            kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0);
+            VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
+            goto skip_injection;
+        }
         sc_ctx.Rip = (DWORD64)sc_addr;
         SetThreadContext(pi.hThread, &sc_ctx);
 
@@ -761,6 +769,7 @@ int main(int argc, char** argv) {
         SetThreadContext(pi.hThread, &orig_ctx);
         VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
         hprintf("[+] Child CR3 submitted successfully\n");
+skip_injection:;
     }
 #endif
 
