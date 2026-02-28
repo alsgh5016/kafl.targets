@@ -274,13 +274,18 @@ void setup_api_hooks(void) {
      * 또는 CreateProcess 이후 프로세스 초기화가 완료된 시점에 호출
      */
     
-    /* 32-bit 타겟의 kernel32.dll / ntdll.dll 베이스 주소 찾기 */
+    /* 32-bit 타겟의 kernel32.dll / kernelbase.dll / ntdll.dll 베이스 주소 찾기 */
     DWORD k32_base = find_module_base_32(g_target.process, g_target.pid, "kernel32.dll");
+    DWORD kb_base = find_module_base_32(g_target.process, g_target.pid, "KernelBase.dll");
     DWORD ntdll_base = find_module_base_32(g_target.process, g_target.pid, "ntdll.dll");
     
     if (!k32_base || !ntdll_base) {
         hprintf("[-] Failed to find 32-bit DLL bases. Skipping API hooks.\n");
         return;
+    }
+    if (!kb_base) {
+        hprintf("[!] KernelBase.dll not found, falling back to kernel32.dll for VirtualAlloc/VirtualProtect\n");
+        kb_base = k32_base;
     }
     
     /* 32-bit Export Table에서 함수 주소 추출 */
@@ -291,14 +296,14 @@ void setup_api_hooks(void) {
     } hook_target_t;
     
     hook_target_t targets[] = {
-        {"kernel32.dll", k32_base, "GetProcAddress"},
-        {"kernel32.dll", k32_base, "VirtualAlloc"},
-        {"kernel32.dll", k32_base, "VirtualProtect"},
-        {"kernel32.dll", k32_base, "WriteProcessMemory"},
-        {"kernel32.dll", k32_base, "LoadLibraryA"},
-        {"kernel32.dll", k32_base, "LoadLibraryW"},
-        {"ntdll.dll",    ntdll_base, "NtProtectVirtualMemory"},
-        {"ntdll.dll",    ntdll_base, "NtWriteVirtualMemory"},
+        {"kernel32.dll",   k32_base,   "GetProcAddress"},
+        {"KernelBase.dll", kb_base,    "VirtualAlloc"},
+        {"KernelBase.dll", kb_base,    "VirtualProtect"},
+        {"kernel32.dll",   k32_base,   "WriteProcessMemory"},
+        {"kernel32.dll",   k32_base,   "LoadLibraryA"},
+        {"kernel32.dll",   k32_base,   "LoadLibraryW"},
+        {"ntdll.dll",      ntdll_base, "NtProtectVirtualMemory"},
+        {"ntdll.dll",      ntdll_base, "NtWriteVirtualMemory"},
     };
     
     int num_targets = sizeof(targets) / sizeof(targets[0]);
