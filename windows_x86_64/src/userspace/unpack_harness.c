@@ -880,10 +880,6 @@ skip_injection:;
     DWORD wait_timeout = (g_timeout_ms == 0) ? INFINITE : g_timeout_ms;
     DWORD wait_result = WaitForSingleObject(pi.hProcess, wait_timeout);
     
-    /* Stop tracing first */
-    kAFL_hypercall(HYPERCALL_KAFL_RELEASE, 0);
-    hprintf("[+] Intel PT tracing stopped\n");
-
     if (wait_result == WAIT_OBJECT_0) {
         /* Process exited before timeout - still try to dump what we can */
         DWORD exit_code = 0;
@@ -903,17 +899,22 @@ skip_injection:;
     /* Dump trace info */
     dump_pt_trace();
     
-    /* Cleanup */
-    hprintf("[+] Cleanup and termination...\n");
-    TerminateProcess(pi.hProcess, 0);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    /* Stop tracing after dump */
+    kAFL_hypercall(HYPERCALL_KAFL_RELEASE, 0);
+    hprintf("[+] Intel PT tracing stopped\n");
     
-    hprintf("===========================================\n");
+    hprintf("===========================================");
     hprintf("  Unpacking complete!\n");
     hprintf("  Check host for dumped files with prefix:\n");
     hprintf("    %s_*\n", g_output_prefix);
-    hprintf("===========================================\n");
+    hprintf("===========================================");
     
+    /* Wait indefinitely - allows user to inspect GUI or attach debugger */
+    hprintf("[+] Waiting indefinitely (use kafl timeout or kill VM to terminate)...\n");
+    while (1) {
+        Sleep(10000);  /* Sleep in 10s intervals to reduce CPU usage */
+    }
+    
+    /* Unreachable - kept for reference */
     return 0;
 }
