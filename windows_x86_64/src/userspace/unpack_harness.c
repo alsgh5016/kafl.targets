@@ -24,7 +24,7 @@
 #include "nyx_api.h"
 
 /* Configuration */
-#define DEFAULT_TIMEOUT_MS      5000
+#define DEFAULT_TIMEOUT_MS      30000
 #define MAX_DUMP_SIZE           (64 * 1024 * 1024)  /* 64MB max dump */
 #define INFO_SIZE               (128 << 10)         /* 128KB info string */
 
