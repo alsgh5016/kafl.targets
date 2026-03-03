@@ -845,7 +845,7 @@ skip_injection:;
 #endif
 
     /* Setup API hooks AFTER child CR3 is submitted so QEMU uses correct CR3 */
-    setup_api_hooks();
+    // [TEST] setup_api_hooks();  /* disabled to test if INT3 hooks cause VMP to exit */
     /* Set IP range for Intel PT to cover unpacking stub and OEP */
     /* Range 0: Entire image for now (packer + unpacked code) */
     if (g_target.image_base && g_target.size_of_image > 0) {
