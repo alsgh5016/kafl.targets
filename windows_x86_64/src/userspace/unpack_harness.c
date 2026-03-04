@@ -687,6 +687,7 @@ int main(int argc, char** argv) {
     
     hprintf("[+] Process created: PID %d\n", g_target.pid);
     
+    
     /* Get process base address via PEB */
     PROCESS_BASIC_INFORMATION pbi;
     ULONG len;
@@ -712,6 +713,11 @@ int main(int argc, char** argv) {
         }
     }
     
+    /* Take early W+X baseline snapshot BEFORE any process execution */
+    /* At this point PE sections are mapped but no code has run yet */
+    hprintf("[+] Taking early W+X baseline snapshot (pre-execution)...\n");
+    kAFL_hypercall(HYPERCALL_KAFL_WOX_SNAPSHOT, 0);
+
     /* Wait for target to initialize (ntdll Ldr to load kernel32.dll) */
     /* We resume, wait, and suspend to allow Ldr to do its job */
     hprintf("[+] Resuming briefly to allow DLL loading...\n");
