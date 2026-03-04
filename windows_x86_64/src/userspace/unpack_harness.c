@@ -60,6 +60,7 @@ static target_process_t g_target = {0};
 static int g_dump_mode = DUMP_MODE_EXECUTABLE;
 static DWORD g_timeout_ms = DEFAULT_TIMEOUT_MS;
 static char g_output_prefix[MAX_PATH] = "unpacked";
+static char g_target_args[MAX_PATH] = "";  /* Arguments to pass to target process */
 
 /*
  * Initialize agent handshake with kAFL/Nyx host
@@ -615,25 +616,31 @@ int main(int argc, char** argv) {
     
     /* Parse arguments */
     if (argc < 2) {
-        hprintf("Usage: %s <packed_exe> [timeout_ms] [dump_mode]\n", argv[0]);
-        hprintf("  timeout_ms: Wait time for unpacking (default: 5000)\n");
-        hprintf("  dump_mode:  0 = executable sections (default)\n");
-        hprintf("              1 = full process memory\n");
-        hprintf("              2 = .text section only\n");
+        hprintf("Usage: %s <packed_exe> [timeout_ms] [dump_mode] [target_args]\n", argv[0]);
+        hprintf("  timeout_ms:   Wait time for unpacking (default: 5000)\n");
+        hprintf("  dump_mode:    0 = executable sections (default)\n");
+        hprintf("                1 = full process memory\n");
+        hprintf("                2 = .text section only\n");
+        hprintf("  target_args:  Arguments to pass to target (e.g., \"-accepteula\")\n");
         habort("No target specified\n");
         return 1;
     }
-    
+
     char* target_exe = argv[1];
-    
+
     if (argc >= 3) {
         g_timeout_ms = atoi(argv[2]);
     }
-    
+
     if (argc >= 4) {
         g_dump_mode = atoi(argv[3]);
     }
-    
+
+    /* Parse target arguments (5th arg onwards) */
+    if (argc >= 5) {
+        strncpy(g_target_args, argv[4], sizeof(g_target_args) - 1);
+        g_target_args[sizeof(g_target_args) - 1] = '\0';
+    }
     /* Extract output prefix from target filename */
     char* basename = strrchr(target_exe, '\\');
     if (basename) {
@@ -649,6 +656,9 @@ int main(int argc, char** argv) {
     if (ext) *ext = '\0';
     
     hprintf("[+] Target: %s\n", target_exe);
+    if (g_target_args[0]) {
+        hprintf("[+] Target args: %s\n", g_target_args);
+    }
     if (g_timeout_ms == 0) {
         hprintf("[+] Timeout: INFINITE (manual termination required)\n");
     } else {
@@ -662,12 +672,21 @@ int main(int argc, char** argv) {
     
     /* Create target process in suspended state */
     si.cb = sizeof(si);
-    
+
+    /* Build command line: "target.exe" + args */
+    char cmdline[MAX_PATH * 2] = {0};
+    if (g_target_args[0]) {
+        snprintf(cmdline, sizeof(cmdline), "\"%s\" %s", target_exe, g_target_args);
+    } else {
+        snprintf(cmdline, sizeof(cmdline), "\"%s\"", target_exe);
+    }
+
     hprintf("[+] Creating target process (suspended)...\n");
-    
+    hprintf("[+] Command line: %s\n", cmdline);
+
     if (!CreateProcessA(
-            target_exe,
-            NULL,
+            NULL,              /* lpApplicationName - use cmdline instead */
+            cmdline,           /* lpCommandLine - full command with args */
             NULL,
             NULL,
             FALSE,
