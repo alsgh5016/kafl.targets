@@ -27,7 +27,7 @@ provision_userspace: compile ansible
 provision_unpack: compile ansible
 	vagrant snapshot restore 'ready_provision'
 	TARGET_HARNESS='unpack' vagrant provision
-	vagrant halt
+	# vagrant halt
 
 provision_driver: compile ansible
 	vagrant snapshot restore 'ready_provision'
