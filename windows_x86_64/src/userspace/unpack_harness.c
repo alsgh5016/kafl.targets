@@ -484,113 +484,200 @@ BOOL parse_pe_headers(HANDLE hProcess, UINT64 base_addr) {
 }
 
 /*
- * Dump process memory based on selected dump mode
+ * Get human-readable memory protection string
  */
-void dump_process_memory(void) {
+static const char* get_protect_string(DWORD protect) {
+    switch (protect & 0xFF) {
+        case PAGE_NOACCESS:          return "---";
+        case PAGE_READONLY:          return "R--";
+        case PAGE_READWRITE:         return "RW-";
+        case PAGE_WRITECOPY:         return "RWC";
+        case PAGE_EXECUTE:           return "--X";
+        case PAGE_EXECUTE_READ:      return "R-X";
+        case PAGE_EXECUTE_READWRITE: return "RWX";
+        case PAGE_EXECUTE_WRITECOPY: return "RWXC";
+        default:                     return "???";
+    }
+}
+
+/*
+ * Get human-readable memory type string
+ */
+static const char* get_type_string(DWORD type) {
+    if (type == MEM_IMAGE)   return "Image";
+    if (type == MEM_MAPPED)  return "Mapped";
+    if (type == MEM_PRIVATE) return "Private";
+    return "Unknown";
+}
+
+/*
+ * Dump entire target process memory for the given round.
+ * Walks all committed regions via VirtualQueryEx, dumps each one,
+ * and generates a memory_map.txt with region info and module mappings.
+ */
+void dump_round_memory(int round) {
     char filename[MAX_PATH];
     BYTE* buffer = NULL;
     SIZE_T bytes_read;
-    
+
+    /* Allocate memory map text buffer */
+    #define MAP_BUF_SIZE (512 * 1024)
+    char* map_buf = (char*)VirtualAlloc(NULL, MAP_BUF_SIZE,
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!map_buf) {
+        hprintf("[-] Failed to allocate memory map buffer\n");
+        return;
+    }
+    int map_off = 0;
+
+    /* Allocate dump buffer */
     buffer = (BYTE*)VirtualAlloc(NULL, MAX_DUMP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!buffer) {
         hprintf("[-] Failed to allocate dump buffer\n");
+        VirtualFree(map_buf, 0, MEM_RELEASE);
         return;
     }
-    
-    switch (g_dump_mode) {
-        case DUMP_MODE_EXECUTABLE:
-            /* Dump all executable sections */
-            for (int i = 0; i < g_target.section_count; i++) {
-                if (g_target.sections[i].characteristics & IMAGE_SCN_MEM_EXECUTE) {
-                    SIZE_T section_size = g_target.sections[i].size;
-                    if (section_size > MAX_DUMP_SIZE) {
-                        section_size = MAX_DUMP_SIZE;
-                    }
-                    
-                    if (ReadProcessMemory(g_target.process, 
-                                         (LPCVOID)g_target.sections[i].base_address,
-                                         buffer, 
-                                         section_size, 
-                                         &bytes_read)) {
-                        snprintf(filename, sizeof(filename), "%s_%s_0x%llx.bin", 
-                                g_output_prefix, 
-                                g_target.sections[i].name,
-                                g_target.sections[i].base_address);
-                        dump_memory_to_host(filename, buffer, bytes_read);
-                    } else {
-                        hprintf("[-] Failed to read section %s: 0x%X\n", 
-                               g_target.sections[i].name, GetLastError());
-                    }
+
+    /* ---- Enumerate loaded modules ---- */
+    typedef struct {
+        UINT64 base;
+        UINT64 size;
+        char path[MAX_PATH];
+    } mod_entry_t;
+    #define MAX_MODULES 512
+    mod_entry_t* mods = (mod_entry_t*)VirtualAlloc(NULL,
+                            sizeof(mod_entry_t) * MAX_MODULES,
+                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    int mod_count = 0;
+
+    if (mods) {
+        HMODULE hMods[MAX_MODULES];
+        DWORD cbNeeded = 0;
+        if (EnumProcessModulesEx(g_target.process, hMods, sizeof(hMods),
+                                  &cbNeeded, LIST_MODULES_ALL)) {
+            int n = cbNeeded / sizeof(HMODULE);
+            if (n > MAX_MODULES) n = MAX_MODULES;
+            for (int i = 0; i < n; i++) {
+                MODULEINFO mi;
+                if (GetModuleInformation(g_target.process, hMods[i],
+                                          &mi, sizeof(mi))) {
+                    mods[mod_count].base = (UINT64)(uintptr_t)mi.lpBaseOfDll;
+                    mods[mod_count].size = (UINT64)mi.SizeOfImage;
+                    GetModuleFileNameExA(g_target.process, hMods[i],
+                                         mods[mod_count].path, MAX_PATH);
+                    mod_count++;
                 }
             }
-            break;
-            
-        case DUMP_MODE_FULL:
-            /* Dump entire image */
-            {
-                UINT64 total_size = 0;
-                for (int i = 0; i < g_target.section_count; i++) {
-                    UINT64 section_end = g_target.sections[i].base_address + 
-                                        g_target.sections[i].size - g_target.image_base;
-                    if (section_end > total_size) {
-                        total_size = section_end;
-                    }
-                }
-                
-                if (total_size > MAX_DUMP_SIZE) {
-                    total_size = MAX_DUMP_SIZE;
-                }
-                
-                if (ReadProcessMemory(g_target.process, 
-                                     (LPCVOID)g_target.image_base,
-                                     buffer, 
-                                     (SIZE_T)total_size, 
-                                     &bytes_read)) {
-                    snprintf(filename, sizeof(filename), "%s_full_0x%llx.bin", 
-                            g_output_prefix, g_target.image_base);
-                    dump_memory_to_host(filename, buffer, bytes_read);
-                } else {
-                    hprintf("[-] Failed to read full image: 0x%X\n", GetLastError());
-                }
-            }
-            break;
-            
-        case DUMP_MODE_TEXT_ONLY:
-            /* Dump only .text section */
-            for (int i = 0; i < g_target.section_count; i++) {
-                if (strcmp(g_target.sections[i].name, ".text") == 0 ||
-                    strcmp(g_target.sections[i].name, "CODE") == 0) {
-                    SIZE_T section_size = g_target.sections[i].size;
-                    if (section_size > MAX_DUMP_SIZE) {
-                        section_size = MAX_DUMP_SIZE;
-                    }
-                    
-                    if (ReadProcessMemory(g_target.process, 
-                                         (LPCVOID)g_target.sections[i].base_address,
-                                         buffer, 
-                                         section_size, 
-                                         &bytes_read)) {
-                        snprintf(filename, sizeof(filename), "%s_text_0x%llx.bin", 
-                                g_output_prefix, g_target.sections[i].base_address);
-                        dump_memory_to_host(filename, buffer, bytes_read);
-                    }
+        } else {
+            hprintf("[!] EnumProcessModulesEx failed: 0x%X\n", GetLastError());
+        }
+    }
+
+    /* ---- Memory map header ---- */
+    map_off += snprintf(map_buf + map_off, MAP_BUF_SIZE - map_off,
+        "=== Memory Map: Round %d ===\n"
+        "Process PID: %lu\n"
+        "Image Base: 0x%llx\n"
+        "Entry Point: 0x%llx\n"
+        "Loaded Modules: %d\n\n"
+        "%-18s %-18s %-10s %-6s %-8s %s\n"
+        "%-18s %-18s %-10s %-6s %-8s %s\n",
+        round, g_target.pid, g_target.image_base, g_target.entry_point, mod_count,
+        "Base", "End", "Size", "Prot", "Type", "Module",
+        "------------------", "------------------", "----------",
+        "------", "--------", "------");
+
+    /* ---- Walk all committed regions ---- */
+    MEMORY_BASIC_INFORMATION mbi;
+    UINT64 addr = 0;
+    int region_count = 0;
+    int dump_count = 0;
+    UINT64 total_dumped = 0;
+
+    while (VirtualQueryEx(g_target.process, (LPCVOID)(uintptr_t)addr,
+                           &mbi, sizeof(mbi))) {
+        UINT64 region_base = (UINT64)(uintptr_t)mbi.BaseAddress;
+        UINT64 region_end = region_base + mbi.RegionSize;
+
+        if (mbi.State == MEM_COMMIT) {
+            /* Find matching module */
+            const char* mod_name = "";
+            for (int i = 0; i < mod_count; i++) {
+                if (region_base >= mods[i].base &&
+                    region_base < mods[i].base + mods[i].size) {
+                    const char* p = strrchr(mods[i].path, '\\');
+                    mod_name = p ? p + 1 : mods[i].path;
                     break;
                 }
             }
-            break;
+
+            const char* prot_str = get_protect_string(mbi.Protect);
+            const char* type_str = get_type_string(mbi.Type);
+
+            /* Add to memory map */
+            map_off += snprintf(map_buf + map_off, MAP_BUF_SIZE - map_off,
+                "0x%016llx 0x%016llx 0x%08llx %-6s %-8s %s\n",
+                region_base, region_end, (UINT64)mbi.RegionSize,
+                prot_str, type_str, mod_name);
+
+            /* Dump this region */
+            SIZE_T to_read = mbi.RegionSize;
+            if (to_read > MAX_DUMP_SIZE) to_read = MAX_DUMP_SIZE;
+
+            if (ReadProcessMemory(g_target.process, mbi.BaseAddress,
+                                   buffer, to_read, &bytes_read)) {
+                snprintf(filename, sizeof(filename), "%s_r%d_0x%llx_0x%llx.bin",
+                        g_output_prefix, round,
+                        region_base, (UINT64)mbi.RegionSize);
+                dump_memory_to_host(filename, buffer, bytes_read);
+                dump_count++;
+                total_dumped += bytes_read;
+            }
+
+            region_count++;
+        }
+
+        /* Advance to next region */
+        addr = region_end;
+        if (addr <= region_base) break;  /* overflow guard */
     }
-    
-    /* Also dump PE header for reconstruction */
-    if (ReadProcessMemory(g_target.process, 
-                         (LPCVOID)g_target.image_base,
-                         buffer, 
-                         4096, 
-                         &bytes_read)) {
-        snprintf(filename, sizeof(filename), "%s_header.bin", g_output_prefix);
-        dump_memory_to_host(filename, buffer, bytes_read);
+
+    /* ---- Append module list to memory map ---- */
+    map_off += snprintf(map_buf + map_off, MAP_BUF_SIZE - map_off,
+        "\n=== Loaded Modules ===\n"
+        "%-18s %-10s %s\n"
+        "%-18s %-10s %s\n",
+        "Base", "Size", "Path",
+        "------------------", "----------", "----");
+    for (int i = 0; i < mod_count; i++) {
+        map_off += snprintf(map_buf + map_off, MAP_BUF_SIZE - map_off,
+            "0x%016llx 0x%08llx %s\n",
+            mods[i].base, mods[i].size, mods[i].path);
     }
-    
+
+    /* ---- Summary ---- */
+    map_off += snprintf(map_buf + map_off, MAP_BUF_SIZE - map_off,
+        "\n=== Summary ===\n"
+        "Committed regions: %d\n"
+        "Dumped regions: %d\n"
+        "Total dumped: %llu bytes (%.2f MB)\n",
+        region_count, dump_count,
+        (unsigned long long)total_dumped,
+        (double)total_dumped / (1024.0 * 1024.0));
+
+    /* ---- Save memory map file ---- */
+    snprintf(filename, sizeof(filename), "%s_r%d_memory_map.txt",
+            g_output_prefix, round);
+    dump_memory_to_host(filename, map_buf, (SIZE_T)map_off);
+
+    hprintf("[+] Round %d: dumped %d/%d regions (%.2f MB), map saved\n",
+            round, dump_count, region_count,
+            (double)total_dumped / (1024.0 * 1024.0));
+
+    /* Cleanup */
     VirtualFree(buffer, 0, MEM_RELEASE);
+    VirtualFree(map_buf, 0, MEM_RELEASE);
+    if (mods) VirtualFree(mods, 0, MEM_RELEASE);
 }
 
 /*
@@ -943,7 +1030,7 @@ skip_injection:;
         /* 5. Dump unpacked memory */
         if (!process_exited) {
             hprintf("[+] Dumping unpacked memory (round %d)...\n", round);
-            dump_process_memory();
+            dump_round_memory(round);
         }
 
         /* 6. Stop tracing — RELEASE returns WtE count */
