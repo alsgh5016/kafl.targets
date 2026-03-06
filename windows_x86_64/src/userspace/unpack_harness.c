@@ -61,6 +61,7 @@ static int g_dump_mode = DUMP_MODE_EXECUTABLE;
 static DWORD g_timeout_ms = DEFAULT_TIMEOUT_MS;
 static char g_output_prefix[MAX_PATH] = "unpacked";
 static char g_target_args[MAX_PATH] = "";  /* Arguments to pass to target process */
+static char g_target_basename[MAX_PATH] = "target";  /* Target filename without extension */
 
 /*
  * Initialize agent handshake with kAFL/Nyx host
@@ -626,9 +627,9 @@ void dump_round_memory(int round) {
 
             if (ReadProcessMemory(g_target.process, mbi.BaseAddress,
                                    buffer, to_read, &bytes_read)) {
-                snprintf(filename, sizeof(filename), "%s_r%d_0x%llx_0x%llx.bin",
-                        g_output_prefix, round,
-                        region_base, (UINT64)mbi.RegionSize);
+                snprintf(filename, sizeof(filename), "round_%d/%s_0x%llx_0x%llx_%s.bin",
+                        round, g_target_basename,
+                        region_base, (UINT64)mbi.RegionSize, prot_str);
                 dump_memory_to_host(filename, buffer, bytes_read);
                 dump_count++;
                 total_dumped += bytes_read;
@@ -666,8 +667,8 @@ void dump_round_memory(int round) {
         (double)total_dumped / (1024.0 * 1024.0));
 
     /* ---- Save memory map file ---- */
-    snprintf(filename, sizeof(filename), "%s_r%d_memory_map.txt",
-            g_output_prefix, round);
+    snprintf(filename, sizeof(filename), "round_%d/memory_map.txt",
+            round);
     dump_memory_to_host(filename, map_buf, (SIZE_T)map_off);
 
     hprintf("[+] Round %d: dumped %d/%d regions (%.2f MB), map saved\n",
@@ -741,6 +742,15 @@ int main(int argc, char** argv) {
     if (ext) *ext = '\0';
     ext = strstr(g_output_prefix, ".EXE");
     if (ext) *ext = '\0';
+    /* Extract target basename (without extension) for dump filenames */
+    strncpy(g_target_basename, basename, sizeof(g_target_basename) - 1);
+    g_target_basename[sizeof(g_target_basename) - 1] = '\0';
+    {
+        char* bext = strstr(g_target_basename, ".exe");
+        if (bext) *bext = '\0';
+        bext = strstr(g_target_basename, ".EXE");
+        if (bext) *bext = '\0';
+    }
     
     hprintf("[+] Target: %s\n", target_exe);
     if (g_target_args[0]) {
