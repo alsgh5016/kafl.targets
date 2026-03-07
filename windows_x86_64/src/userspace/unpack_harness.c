@@ -1031,14 +1031,15 @@ skip_injection:;
     hprintf("\n==========================================\n");
     hprintf("  Unpacking complete! (WtE: %llu)\n", (unsigned long long)wte_count);
     hprintf("  Per-WtE dumps saved automatically by QEMU\n");
-    hprintf("==========================================");
+    hprintf("==========================================\n");
 
-    /* Wait indefinitely — allows user to inspect GUI or attach debugger */
-    hprintf("[+] Waiting indefinitely (use kafl timeout or kill VM to terminate)...\n");
-    while (1) {
-        Sleep(10000);  /* Sleep in 10s intervals to reduce CPU usage */
-    }
-    
-    /* Unreachable - kept for reference */
+    /* Signal host to stop — single execution mode, no more rounds needed.
+     * habort() triggers HYPERCALL_KAFL_USER_ABORT which tells the kAFL
+     * frontend to terminate the campaign cleanly. Without this, the
+     * kAFL timeout would restore the VM snapshot and start another round. */
+    hprintf("[+] Single execution complete. Signaling host to stop.\n");
+    habort("WtE single execution complete");
+
+    /* Unreachable */
     return 0;
 }
