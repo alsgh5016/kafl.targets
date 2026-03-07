@@ -829,142 +829,40 @@ int main(int argc, char** argv) {
         }
     }
     
-    /* Take early W+X baseline snapshot BEFORE any process execution */
-    /* At this point PE sections are mapped but no code has run yet */
-    hprintf("[+] Taking early W+X baseline snapshot (pre-execution)...\n");
-    kAFL_hypercall(HYPERCALL_KAFL_WOX_SNAPSHOT, 0);
-
-    /* Wait for target to initialize (ntdll Ldr to load kernel32.dll) */
-    /* We resume, wait, and suspend to allow Ldr to do its job */
-    hprintf("[+] Resuming briefly to allow DLL loading...\n");
-    ResumeThread(pi.hThread);
-    Sleep(100); // 100ms is usually enough for Ldr
-    SuspendThread(pi.hThread);
-    hprintf("[+] Process suspended again.\n");
-    
-    /* We will setup API hooks AFTER we submit the child's CR3 */
-#if 1
-    /* Submit child process CR3 for Intel PT filtering via vmcall injection */
-    hprintf("[+] Submitting child process CR3 via vmcall injection...\n");
+    /* ── WTE_SETUP: Initialize WtE BEFORE target executes ──────────────
+     * QEMU will:
+     *   1. Create root snapshot (baseline memory content)
+     *   2. Walk EPROCESS to find child CR3 by PID
+     *   3. wte_init() + wte_activate(child_cr3)
+     *   4. Eagerly set EPT NX on all target PE pages
+     * This ensures the FIRST instruction of the target triggers WtE. */
     {
-        /*
-         * Shellcode: vmcall(rax=0x1f, rbx=SUBMIT_CR3(5), rcx=0)
-         * QEMU-Nyx patched handler reads env->cr[3] when arg=0,
-         * so child's actual CR3 is captured automatically.
-         * Ends with jmp $ (spin) so we can recapture the thread.
-         */
-        BYTE cr3_shellcode[] = {
-            0x48, 0xB8, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* mov rax, 0x1f */
-            0x48, 0xBB, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* mov rbx, 5 (SUBMIT_CR3) */
-            0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  /* mov rcx, 0 */
-            0x0F, 0x01, 0xC1,                                              /* vmcall */
-            0xEB, 0xFE                                                      /* jmp $ (spin) */
-        };
+        kafl_wte_setup_t wte_setup = {0};
+        wte_setup.target_pid  = (uint64_t)g_target.pid;
+        wte_setup.image_base  = g_target.image_base;
+        wte_setup.image_size  = (uint64_t)g_target.size_of_image;
+        wte_setup.flags       = WTE_FLAG_32BIT | WTE_FLAG_EAGER_NX;
 
-        LPVOID sc_addr = VirtualAllocEx(pi.hProcess, NULL, sizeof(cr3_shellcode),
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!sc_addr) {
-            hprintf("[-] VirtualAllocEx for shellcode failed: 0x%X\n", GetLastError());
-            habort("Failed to inject CR3 shellcode\n");
+        hprintf("[+] WTE_SETUP: PID=%d image_base=0x%llx size=0x%llx flags=0x%x\n",
+                g_target.pid,
+                (unsigned long long)wte_setup.image_base,
+                (unsigned long long)wte_setup.image_size,
+                wte_setup.flags);
+
+        uint64_t child_cr3 = kAFL_hypercall(HYPERCALL_KAFL_WTE_SETUP,
+                                             (UINT64)&wte_setup);
+        if (child_cr3 == 0) {
+            hprintf("[-] WTE_SETUP failed: could not find child CR3\n");
+            habort("WTE_SETUP failed\n");
+            return 1;
         }
+        hprintf("[+] WTE_SETUP success: child CR3=0x%llx\n",
+                (unsigned long long)child_cr3);
 
-        if (!WriteProcessMemory(pi.hProcess, sc_addr, cr3_shellcode,
-                                sizeof(cr3_shellcode), NULL)) {
-            hprintf("[-] WriteProcessMemory for shellcode failed: 0x%X\n", GetLastError());
-            VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-            habort("Failed to write CR3 shellcode\n");
-        }
-
-        CONTEXT orig_ctx = {0};
-        orig_ctx.ContextFlags = CONTEXT_FULL;
-        GetThreadContext(pi.hThread, &orig_ctx);
-
-        CONTEXT sc_ctx = orig_ctx;
-        BOOL isWow64 = FALSE;
-        IsWow64Process(pi.hProcess, &isWow64);
-        if (isWow64) {
-            hprintf("[+] WOW64 Target detected. Using 32-bit shellcode for CR3 submission...\n");
-            VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-            
-            /*
-             * 32-bit shellcode for WOW64 process:
-             * vmcall(eax=0x1f, ebx=SUBMIT_CR3(5), ecx=0)
-             * QEMU-Nyx reads CR3 from vCPU when arg=0, capturing the 32-bit process's CR3.
-             */
-            BYTE cr3_shellcode_32[] = {
-                0xB8, 0x1F, 0x00, 0x00, 0x00,  /* mov eax, 0x1f */
-                0xBB, 0x05, 0x00, 0x00, 0x00,  /* mov ebx, 5 (SUBMIT_CR3) */
-                0xB9, 0x00, 0x00, 0x00, 0x00,  /* mov ecx, 0 */
-                0x0F, 0x01, 0xC1,              /* vmcall */
-                0xEB, 0xFE                     /* jmp $ (spin) */
-            };
-            
-            /* Allocate in low 4GB for 32-bit addressing */
-            sc_addr = VirtualAllocEx(pi.hProcess, NULL, sizeof(cr3_shellcode_32),
-                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (!sc_addr) {
-                hprintf("[-] VirtualAllocEx for 32-bit shellcode failed: 0x%X\n", GetLastError());
-                habort("Failed to inject 32-bit CR3 shellcode\n");
-            }
-            
-            /* Verify address is in 32-bit range */
-            if ((UINT64)sc_addr > 0xFFFFFFFF) {
-                hprintf("[-] Shellcode allocated above 4GB (0x%llx), cannot use for WOW64\n", (UINT64)sc_addr);
-                VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-                habort("32-bit shellcode address out of range\n");
-            }
-            
-            if (!WriteProcessMemory(pi.hProcess, sc_addr, cr3_shellcode_32,
-                                    sizeof(cr3_shellcode_32), NULL)) {
-                hprintf("[-] WriteProcessMemory for 32-bit shellcode failed: 0x%X\n", GetLastError());
-                VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-                habort("Failed to write 32-bit CR3 shellcode\n");
-            }
-            
-            /* Use WOW64_CONTEXT for 32-bit thread manipulation */
-            WOW64_CONTEXT wow_ctx = {0};
-            wow_ctx.ContextFlags = WOW64_CONTEXT_FULL;
-            if (!Wow64GetThreadContext(pi.hThread, &wow_ctx)) {
-                hprintf("[-] Wow64GetThreadContext failed: 0x%X\n", GetLastError());
-                VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-                habort("Failed to get WOW64 context\n");
-            }
-            
-            WOW64_CONTEXT orig_wow_ctx = wow_ctx;
-            wow_ctx.Eip = (DWORD)(UINT_PTR)sc_addr;
-            
-            if (!Wow64SetThreadContext(pi.hThread, &wow_ctx)) {
-                hprintf("[-] Wow64SetThreadContext failed: 0x%X\n", GetLastError());
-                VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-                habort("Failed to set WOW64 context\n");
-            }
-            
-            /* Resume briefly to execute vmcall */
-            ResumeThread(pi.hThread);
-            Sleep(100);
-            SuspendThread(pi.hThread);
-            
-            /* Restore original context and cleanup */
-            Wow64SetThreadContext(pi.hThread, &orig_wow_ctx);
-            VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-            hprintf("[+] WOW64 Child CR3 submitted successfully\n");
-        } else {
-            sc_ctx.Rip = (DWORD64)sc_addr;
-            SetThreadContext(pi.hThread, &sc_ctx);
-
-            /* Briefly resume to execute vmcall, then recapture */
-            ResumeThread(pi.hThread);
-            Sleep(100);
-            SuspendThread(pi.hThread);
-
-            /* Restore original context and free shellcode memory */
-            SetThreadContext(pi.hThread, &orig_ctx);
-            VirtualFreeEx(pi.hProcess, sc_addr, 0, MEM_RELEASE);
-            hprintf("[+] Child CR3 submitted successfully\n");
-        }
-skip_injection:;
+        /* Submit discovered CR3 for Intel PT filtering as well */
+        kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, child_cr3);
+        hprintf("[+] Child CR3 submitted for PT filtering\n");
     }
-#endif
 
     /* Setup API hooks AFTER child CR3 is submitted so QEMU uses correct CR3 */
     // [TEST] setup_api_hooks();  /* disabled to test if INT3 hooks cause VMP to exit */
@@ -988,12 +886,13 @@ skip_injection:;
     /* =========================================================
      * Single-execution WtE (Written-then-Executed) detection
      *
-     * Single-execution model:
-     *   1. ACQUIRE  — start Intel PT tracing + WtE monitoring
-     *   2. Resume   — let packer execute (write + execute)
-     *   3. Timeout  — wait for unpacking activity
-     *   4. Suspend  — pause target
-     *   5. RELEASE  — stop tracing, returns WtE count from QEMU
+     * New flow (zero timing gap):
+     *   0. WTE_SETUP — WtE already active with eager NX
+     *   1. ACQUIRE   — start Intel PT tracing
+     *   2. Resume    — target starts, WtE catches FIRST write+exec
+     *   3. Timeout   — wait for unpacking activity
+     *   4. Suspend   — pause target
+     *   5. RELEASE   — stop tracing, returns WtE count from QEMU
      *
      * Per-WtE full process memory dumps happen automatically in
      * QEMU on each confirmed WtE detection — no harness-side dump.
