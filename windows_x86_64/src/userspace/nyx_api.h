@@ -81,6 +81,11 @@
 #define HYPERCALL_KAFL_PERSIST_PAGE_PAST_SNAPSHOT 39
 #define HYPERCALL_KAFL_HOOK_API             40
 #define HYPERCALL_KAFL_WOX_SNAPSHOT         41
+#define HYPERCALL_KAFL_WTE_SETUP            42
+
+/* WTE_SETUP flags */
+#define WTE_FLAG_32BIT      (1 << 0)  /* Target is 32-bit PE (WOW64) */
+#define WTE_FLAG_EAGER_NX   (1 << 1)  /* Set NX on PE pages at setup time */
 
 /* hypertrash only hypercalls */
 #define HYPERTRASH_HYPERCALL_MASK			0xAA000000
@@ -187,6 +192,17 @@ typedef struct {
 	uint64_t num_addresses;
 	uint64_t addresses[479];
 } __attribute__((packed)) req_data_bulk_t;
+
+/* WtE (Written-then-Executed) setup parameters.
+ * Passed to HYPERCALL_KAFL_WTE_SETUP from the harness.
+ * QEMU walks the guest kernel EPROCESS list using target_pid
+ * to discover the child process's CR3 (DirectoryTableBase). */
+typedef struct {
+	uint64_t target_pid;        /* Child process PID */
+	uint64_t image_base;        /* Target PE image base VA */
+	uint64_t image_size;        /* Target PE SizeOfImage */
+	uint32_t flags;             /* WTE_FLAG_32BIT | WTE_FLAG_EAGER_NX */
+} __attribute__((packed)) kafl_wte_setup_t;
 
 #define MAX_API_HOOKS 16
 typedef struct {
