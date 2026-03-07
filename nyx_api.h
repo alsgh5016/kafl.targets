@@ -81,7 +81,7 @@
 #define HYPERCALL_KAFL_PERSIST_PAGE_PAST_SNAPSHOT 39
 #define HYPERCALL_KAFL_HOOK_API             40
 #define HYPERCALL_KAFL_WOX_SNAPSHOT         41
-#define HYPERCALL_KAFL_WTE_SETUP            42
+#define HYPERCALL_KAFL_WTE_SETUP            43
 
 /* WTE_SETUP flags */
 #define WTE_FLAG_32BIT      (1 << 0)  /* Target is 32-bit PE (WOW64) */
