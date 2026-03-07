@@ -986,94 +986,52 @@ skip_injection:;
     /* This avoids anti-debug detection by VMProtect */
     
     /* =========================================================
-     * Multi-round WtE (Written-then-Executed) detection loop
+     * Single-execution WtE (Written-then-Executed) detection
      *
-     * Each round:
-     *   1. ACQUIRE  — start Intel PT tracing
+     * Single-execution model:
+     *   1. ACQUIRE  — start Intel PT tracing + WtE monitoring
      *   2. Resume   — let packer execute (write + execute)
      *   3. Timeout  — wait for unpacking activity
      *   4. Suspend  — pause target
-     *   5. Dump     — save unpacked memory
-     *   6. RELEASE  — stop tracing, returns WtE count from QEMU
+     *   5. RELEASE  — stop tracing, returns WtE count from QEMU
      *
-     * If RELEASE returns wte_count > 0, QEMU detected new WtE
-     * pages in this round.  We loop to catch the next unpacking
-     * layer.  If wte_count == 0, no more WtE activity — done.
+     * Per-WtE full process memory dumps happen automatically in
+     * QEMU on each confirmed WtE detection — no harness-side dump.
      * ========================================================= */
-    #define MAX_WTE_ROUNDS 32
     DWORD wait_timeout = (g_timeout_ms == 0) ? INFINITE : g_timeout_ms;
-    int round = 0;
-    int process_exited = 0;
 
-    hprintf("[+] Starting multi-round WtE detection...\n");
+    hprintf("[+] Starting single-execution WtE detection...\n");
 
-    do {
-        hprintf("\n[+] === WtE Round %d ===\n", round);
+    /* 1. Start tracing */
+    kAFL_hypercall(HYPERCALL_KAFL_ACQUIRE, 0);
+    hprintf("[+] Intel PT tracing started\n");
 
-        /* 1. Start tracing */
-        kAFL_hypercall(HYPERCALL_KAFL_ACQUIRE, 0);
-        hprintf("[+] Intel PT tracing started (round %d)\n", round);
+    /* 2. Resume target process */
+    ResumeThread(pi.hThread);
+    hprintf("[+] Target process resumed\n");
 
-        /* 2. Resume target process */
-        if (!process_exited) {
-            ResumeThread(pi.hThread);
-            hprintf("[+] Target process resumed\n");
+    /* 3. Wait for unpacking activity */
+    DWORD wait_result = WaitForSingleObject(pi.hProcess, wait_timeout);
 
-            /* 3. Wait for unpacking activity */
-            DWORD wait_result = WaitForSingleObject(pi.hProcess, wait_timeout);
-
-            if (wait_result == WAIT_OBJECT_0) {
-                DWORD exit_code = 0;
-                GetExitCodeProcess(pi.hProcess, &exit_code);
-                hprintf("[!] Process exited (code %d) during round %d\n",
-                        exit_code, round);
-                process_exited = 1;
-            } else if (wait_result == WAIT_TIMEOUT) {
-                /* 4. Suspend target */
-                hprintf("[+] Timeout reached — suspending target\n");
-                SuspendThread(pi.hThread);
-            }
-        } else {
-            hprintf("[!] Process already exited — skipping resume\n");
-        }
-
-        /* 5. Dump unpacked memory */
-        if (!process_exited) {
-            hprintf("[+] Dumping unpacked memory (round %d)...\n", round);
-            dump_round_memory(round);
-        }
-
-        /* 6. Stop tracing — RELEASE returns WtE count */
-        uint64_t wte_count = kAFL_hypercall(HYPERCALL_KAFL_RELEASE, 0);
-        hprintf("[+] Intel PT tracing stopped — WtE count: %llu\n",
-                (unsigned long long)wte_count);
-
-        round++;
-
-        if (wte_count == 0) {
-            hprintf("[+] No WtE detected in this round — unpacking complete\n");
-            break;
-        }
-
-        if (process_exited) {
-            hprintf("[+] Process exited — no more rounds possible\n");
-            break;
-        }
-
-        hprintf("[+] WtE detected (%llu pages) — starting next round\n",
-                (unsigned long long)wte_count);
-
-    } while (round < MAX_WTE_ROUNDS);
-
-    if (round >= MAX_WTE_ROUNDS) {
-        hprintf("[!] Reached max WtE rounds (%d) — stopping\n", MAX_WTE_ROUNDS);
+    if (wait_result == WAIT_OBJECT_0) {
+        DWORD exit_code = 0;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        hprintf("[!] Process exited (code %d)\n", exit_code);
+    } else if (wait_result == WAIT_TIMEOUT) {
+        /* 4. Suspend target */
+        hprintf("[+] Timeout reached \xe2\x80\x94 suspending target\n");
+        SuspendThread(pi.hThread);
     }
 
+    /* 5. Stop tracing — RELEASE returns WtE count */
+    uint64_t wte_count = kAFL_hypercall(HYPERCALL_KAFL_RELEASE, 0);
+    hprintf("[+] Intel PT tracing stopped \xe2\x80\x94 WtE count: %llu\n",
+            (unsigned long long)wte_count);
+
     hprintf("\n==========================================\n");
-    hprintf("  Unpacking complete! (%d rounds)\n", round);
-    hprintf("  Check host for dumped files with prefix:\n");
-    hprintf("    %s_*\n", g_output_prefix);
-    hprintf("==========================================\n");
+    hprintf("  Unpacking complete! (WtE: %llu)\n", (unsigned long long)wte_count);
+    hprintf("  Per-WtE dumps saved automatically by QEMU\n");
+    hprintf("==========================================");
 
     /* Wait indefinitely — allows user to inspect GUI or attach debugger */
     hprintf("[+] Waiting indefinitely (use kafl timeout or kill VM to terminate)...\n");
