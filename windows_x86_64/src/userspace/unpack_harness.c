@@ -485,6 +485,51 @@ BOOL parse_pe_headers(HANDLE hProcess, UINT64 base_addr) {
 }
 
 /*
+ * Pre-fault all PE pages into physical memory.
+ * 
+ * Windows uses demand paging, so PE pages aren't mapped to physical memory
+ * until they're accessed. This causes issues with WtE detection because QEMU
+ * can't set EPT NX on unmapped pages.
+ * 
+ * This function forces all PE pages into memory by reading 1 byte from each
+ * page via ReadProcessMemory. After this, QEMU's wte_diagnose_target_pe() will
+ * see all pages as mapped and can properly set NX on them.
+ * 
+ * @param hProcess   Target process handle
+ * @param image_base PE image base address
+ * @param image_size Size of the PE image (SizeOfImage)
+ * @return Number of pages successfully faulted in
+ */
+int prefault_pe_pages(HANDLE hProcess, UINT64 image_base, UINT64 image_size) {
+    int faulted = 0;
+    int failed = 0;
+    UINT8 dummy;
+    SIZE_T bytes_read;
+    
+    hprintf("[+] Pre-faulting PE pages: 0x%llx - 0x%llx (0x%llx bytes)\n",
+            (unsigned long long)image_base,
+            (unsigned long long)(image_base + image_size),
+            (unsigned long long)image_size);
+    
+    /* Touch each page to force it into physical memory */
+    for (UINT64 va = image_base; va < image_base + image_size; va += 0x1000) {
+        if (ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)va, &dummy, 1, &bytes_read)) {
+            faulted++;
+        } else {
+            /* Page might be guard page or not committed - this is normal for
+             * sparse PE sections. Just count it and continue. */
+            failed++;
+        }
+    }
+    
+    int total_pages = (int)((image_size + 0xFFF) / 0x1000);
+    hprintf("[+] Pre-fault complete: %d/%d pages faulted (%d failed/guard)\n",
+            faulted, total_pages, failed);
+    
+    return faulted;
+}
+
+/*
  * Get human-readable memory protection string
  */
 static const char* get_protect_string(DWORD protect) {
@@ -827,6 +872,20 @@ int main(int argc, char** argv) {
                 hprintf("[-] Failed to parse PE headers\n");
             }
         }
+    }
+
+    /* ── Pre-fault PE pages BEFORE WTE_SETUP ───────────────────────────
+     * Windows demand paging means most PE pages aren't in physical memory
+     * until accessed. QEMU's eager NX logic can only set NX on pages that
+     * are currently mapped. By pre-faulting all PE pages here, we ensure
+     * QEMU can set NX on ALL pages, not just the 3-4 that happen to be
+     * mapped at process creation time.
+     * 
+     * Without this, addresses like 0x406afa (OEP) might be unmapped when
+     * WTE_SETUP runs, causing WtE detection to miss critical events. */
+    if (g_target.image_base && g_target.size_of_image > 0) {
+        prefault_pe_pages(pi.hProcess, g_target.image_base, 
+                          g_target.size_of_image);
     }
     
     /* ── WTE_SETUP: Initialize WtE BEFORE target executes ──────────────
