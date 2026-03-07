@@ -859,9 +859,14 @@ int main(int argc, char** argv) {
         hprintf("[+] WTE_SETUP success: child CR3=0x%llx\n",
                 (unsigned long long)child_cr3);
 
-        /* Submit discovered CR3 for Intel PT filtering as well */
-        kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, child_cr3);
-        hprintf("[+] Child CR3 submitted for PT filtering\n");
+        /* Submit harness CR3 for Intel PT filtering.
+         * NOTE: KVM always replaces the arg with current vCPU CR3 for
+         * SUBMIT_CR3, so passing child_cr3 here has no effect.
+         * Pass 0 to explicitly request auto-capture of harness CR3.
+         * WtE target CR3 (child process) is already set by WTE_SETUP
+         * and QEMU's SUBMIT_CR3 handler preserves it when WtE is active. */
+        kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0);
+        hprintf("[+] Harness CR3 submitted for Intel PT filtering\n");
     }
 
     /* Setup API hooks AFTER child CR3 is submitted so QEMU uses correct CR3 */
