@@ -24,7 +24,7 @@
 #include "nyx_api.h"
 
 /* Configuration */
-#define DEFAULT_TIMEOUT_MS      30000
+#define DEFAULT_TIMEOUT_MS      300000  /* 5 minutes — give packer time to unpack */
 #define MAX_DUMP_SIZE           (64 * 1024 * 1024)  /* 64MB max dump */
 #define INFO_SIZE               (128 << 10)         /* 128KB info string */
 
@@ -771,6 +771,9 @@ int main(int argc, char** argv) {
     if (argc >= 3) {
         g_timeout_ms = atoi(argv[2]);
     }
+    /* DEBUG: Force 5-minute timeout for Dual-Watch testing.
+     * Remove this override once VM shortcut is updated. */
+    g_timeout_ms = DEFAULT_TIMEOUT_MS;
 
     if (argc >= 4) {
         g_dump_mode = atoi(argv[3]);
