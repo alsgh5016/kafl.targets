@@ -511,9 +511,16 @@ int prefault_pe_pages(HANDLE hProcess, UINT64 image_base, UINT64 image_size) {
             (unsigned long long)(image_base + image_size),
             (unsigned long long)image_size);
     
-    /* Touch each page to force it into physical memory */
+    /* Touch each page with WRITE to break Copy-on-Write.
+     * ReadProcessMemory only faults pages in as shared/CoW, so EPT W=0
+     * never fires (guest #PF handles CoW before EPT is checked).
+     * WriteProcessMemory forces Windows to allocate private pages,
+     * so EPT protections apply to the actual GFNs the packer will use. */
     for (UINT64 va = image_base; va < image_base + image_size; va += 0x1000) {
         if (ReadProcessMemory(hProcess, (LPCVOID)(uintptr_t)va, &dummy, 1, &bytes_read)) {
+            /* Write the same byte back to trigger CoW */
+            SIZE_T bytes_written;
+            WriteProcessMemory(hProcess, (LPVOID)(uintptr_t)va, &dummy, 1, &bytes_written);
             faulted++;
         } else {
             /* Page might be guard page or not committed - this is normal for
