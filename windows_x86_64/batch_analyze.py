@@ -155,28 +155,45 @@ def resolve_kafl_yaml(project_dir: Path) -> KaflYamlConfig:
     return KaflYamlConfig(base_image=base_image, qemu_memory=qemu_memory)
 
 
-def create_standalone_image(base_image: Path, output_path: Path) -> Path:
-    """Create a standalone qcow2 copy of the base image.
+def _detect_image_format(image_path: Path) -> str:
+    """Detect the actual format of a disk image using qemu-img info."""
+    try:
+        result = subprocess.run(
+            ["qemu-img", "info", "--output=json", str(image_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            fmt = info.get("format", "raw")
+            logger.debug("Detected image format: %s -> %s", image_path.name, fmt)
+            return fmt
+    except Exception as e:
+        logger.warning("Failed to detect image format: %s", e)
+    return "raw"
 
-    Unlike a thin overlay, this copy does NOT reference the base image,
-    so vagrant can freely modify the base for the next sample while
-    QEMU uses this copy for analysis.
+
+def create_standalone_image(base_image: Path, output_path: Path) -> Path:
+    """Create a standalone copy of the base image.
+
+    Uses the same format as the base image to avoid conversion issues.
+    The copy has NO backing file reference, so vagrant can freely modify
+    the base for the next sample while QEMU uses this copy for analysis.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Detect base image format
-    base_format = "raw"
-    if base_image.suffix in (".qcow2", ".qcow"):
-        base_format = "qcow2"
+    base_format = _detect_image_format(base_image)
+    # Use the same output format to avoid conversion artifacts
+    out_format = base_format
 
     start = time.time()
     cmd = [
         "qemu-img", "convert",
         "-f", base_format,
-        "-O", "qcow2",
+        "-O", out_format,
         str(base_image),
         str(output_path),
     ]
+    logger.info("Converting: %s (%s) -> %s (%s)", base_image.name, base_format, output_path.name, out_format)
     result = subprocess.run(
         cmd, capture_output=True, text=True,
         timeout=QEMU_IMG_CONVERT_TIMEOUT_SECONDS,
@@ -467,6 +484,14 @@ def run_kafl(
         raise subprocess.TimeoutExpired(cmd, timeout, stdout, stderr)
 
     logger.debug("kAFL exited with rc=%d", proc.returncode)
+    if proc.returncode != 0:
+        logger.error("kAFL failed (rc=%d)", proc.returncode)
+        if stdout and stdout.strip():
+            for line in stdout.strip().splitlines()[-20:]:
+                logger.error("  stdout: %s", line)
+        if stderr and stderr.strip():
+            for line in stderr.strip().splitlines()[-20:]:
+                logger.error("  stderr: %s", line)
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
@@ -646,6 +671,7 @@ def process_sample(
 
     except Exception as e:
         duration = time.time() - start_time
+        logger.error("[ERROR] %s: %s", sample_name, e)
         _, dump_count, wte_count = _safe_validate(worker_workdir)
         result = SampleResult(
             sample_name=sample_name,
