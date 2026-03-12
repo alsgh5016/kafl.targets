@@ -395,6 +395,9 @@ def provision_vm(sample_path: Path, project_dir: Path) -> None:
     shutil.copy2(sample_path, target_path)
     logger.info("Copied %s -> target_packed.exe", sample_path.name)
 
+    # Ensure no stale vagrant lock from a previous failed cycle
+    _cleanup_vagrant_lock(project_dir)
+
     _run_cmd(
         ["make", "provision_unpack"],
         cwd=project_dir,
@@ -402,14 +405,56 @@ def provision_vm(sample_path: Path, project_dir: Path) -> None:
         label="make provision_unpack",
     )
 
-    # Clean shutdown (not -f) is required: forced poweroff leaves qcow2
-    # in a dirty state that prevents QEMU-Nyx from booting successfully.
-    _run_cmd(
-        ["vagrant", "halt"],
-        cwd=project_dir,
-        timeout=VAGRANT_HALT_TIMEOUT_SECONDS,
-        label="vagrant halt",
-    )
+    # Clean shutdown preserves qcow2 disk state for QEMU-Nyx.
+    # Fall back to forced halt if guest communication fails (e.g. WinRM down).
+    _halt_vagrant(project_dir)
+
+
+def _halt_vagrant(project_dir: Path) -> None:
+    """Halt vagrant VM: try clean shutdown, fall back to forced halt."""
+    try:
+        result = subprocess.run(
+            ["vagrant", "halt"],
+            cwd=project_dir, capture_output=True, text=True,
+            timeout=VAGRANT_HALT_TIMEOUT_SECONDS,
+        )
+        if result.returncode == 0:
+            return
+        logger.warning(
+            "Clean vagrant halt failed (rc=%d), falling back to forced halt",
+            result.returncode,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Clean vagrant halt timed out, falling back to forced halt")
+
+    # Force halt as fallback
+    try:
+        subprocess.run(
+            ["vagrant", "halt", "-f"],
+            cwd=project_dir, capture_output=True, text=True,
+            timeout=60,
+        )
+    except Exception as e:
+        logger.warning("Forced vagrant halt also failed: %s", e)
+
+    # Clean up stale vagrant lock if needed
+    _cleanup_vagrant_lock(project_dir)
+
+
+def _cleanup_vagrant_lock(project_dir: Path) -> None:
+    """Kill stale vagrant/ruby processes that hold the machine lock."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", "vagrant"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            stale = result.stdout.strip().splitlines()
+            logger.warning("Found %d stale vagrant process(es), killing...", len(stale))
+            subprocess.run(["pkill", "-9", "-f", "vagrant"], capture_output=True, timeout=10)
+            time.sleep(1)
+    except Exception as e:
+        logger.debug("Vagrant lock cleanup failed: %s", e)
 
 
 def _run_cmd(
