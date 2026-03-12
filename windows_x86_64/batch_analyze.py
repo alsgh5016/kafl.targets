@@ -653,7 +653,7 @@ def process_sample(
     """
     sample_name = sample_path.stem
     start = time.time()
-    workdir = config.workdir_base / f"w{worker.worker_id}"
+    workdir = config.workdir_base / sample_name
     result: Optional[SampleResult] = None
 
     try:
