@@ -187,6 +187,162 @@ def remove_worker_image(image_path: Path) -> None:
         logger.debug("Failed to remove image %s: %s", image_path, e)
 
 
+# -- Environment Preflight Check --
+
+def preflight_check(project_dir: Path) -> None:
+    """Verify environment is clean before starting batch analysis.
+
+    Checks for:
+      1. Stray QEMU processes (from previous kafl runs)
+      2. Vagrant/libvirt VM in unexpected state
+      3. Snapshot 'ready_provision' availability
+
+    If issues are found, attempts automatic recovery:
+      kill QEMU → vagrant destroy → vagrant up → snapshot save
+    """
+    logger.info("Running preflight checks...")
+
+    # 1. Kill any stray QEMU processes
+    stray_qemu = _find_stray_qemu()
+    if stray_qemu:
+        logger.warning("Found %d stray QEMU process(es), killing...", len(stray_qemu))
+        _kill_all_qemu()
+        time.sleep(2)
+
+    # 2. Check vagrant/libvirt state
+    if not _is_vagrant_healthy(project_dir):
+        logger.warning("Vagrant VM is in an unhealthy state, rebuilding...")
+        _rebuild_vagrant(project_dir)
+        return
+
+    # 3. Verify snapshot exists and is restorable
+    if not _test_snapshot_restore(project_dir):
+        logger.warning("Snapshot 'ready_provision' unusable, rebuilding...")
+        _rebuild_vagrant(project_dir)
+        return
+
+    logger.info("Preflight checks passed")
+
+
+def _find_stray_qemu() -> list[str]:
+    """Find stray QEMU processes."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", "qemu-system-x86_64"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()
+    except Exception:
+        pass
+    return []
+
+
+def _kill_all_qemu() -> None:
+    """Kill all QEMU processes."""
+    try:
+        subprocess.run(["pkill", "-9", "qemu-system-x86_64"],
+                        capture_output=True, timeout=10)
+    except Exception as e:
+        logger.debug("pkill qemu failed: %s", e)
+
+
+def _is_vagrant_healthy(project_dir: Path) -> bool:
+    """Check if vagrant VM is in a usable state."""
+    try:
+        result = subprocess.run(
+            ["vagrant", "status", "--machine-readable"],
+            cwd=project_dir, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return False
+        # Check for known bad states
+        output = result.stdout
+        # machine-readable format: timestamp,target,type,data
+        for line in output.splitlines():
+            parts = line.split(",")
+            if len(parts) >= 4 and parts[2] == "state":
+                state = parts[3]
+                logger.info("Vagrant VM state: %s", state)
+                # Valid states: shutoff, running, not_created
+                if state in ("shutoff", "not_created"):
+                    return True
+                if state == "running":
+                    # Running is OK, vagrant halt will handle it
+                    return True
+                # paused, crashed, etc. → unhealthy
+                logger.warning("Vagrant VM in unexpected state: %s", state)
+                return False
+        return True
+    except Exception as e:
+        logger.warning("Vagrant status check failed: %s", e)
+        return False
+
+
+def _test_snapshot_restore(project_dir: Path) -> bool:
+    """Test if 'ready_provision' snapshot can be restored."""
+    try:
+        # List snapshots to check if it exists
+        result = subprocess.run(
+            ["vagrant", "snapshot", "list"],
+            cwd=project_dir, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return False
+        if "ready_provision" not in result.stdout:
+            logger.warning("Snapshot 'ready_provision' not found")
+            return False
+
+        # Try actual restore
+        result = subprocess.run(
+            ["vagrant", "snapshot", "restore", "ready_provision"],
+            cwd=project_dir, capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            logger.warning("Snapshot restore failed: %s", result.stderr[-300:])
+            return False
+
+        # Halt after successful test restore
+        subprocess.run(
+            ["vagrant", "halt", "-f"],
+            cwd=project_dir, capture_output=True, timeout=60,
+        )
+        return True
+    except Exception as e:
+        logger.warning("Snapshot test failed: %s", e)
+        return False
+
+
+def _rebuild_vagrant(project_dir: Path) -> None:
+    """Full rebuild: destroy → up → snapshot save."""
+    logger.info("Rebuilding vagrant VM (this may take a few minutes)...")
+
+    steps = [
+        (["vagrant", "destroy", "-f"], "vagrant destroy", 120),
+        (["vagrant", "up", "--no-provision"], "vagrant up", 600),
+        (["vagrant", "snapshot", "save", "ready_provision"], "snapshot save", 120),
+    ]
+
+    for cmd, label, timeout in steps:
+        logger.info("  Running: %s", label)
+        try:
+            result = subprocess.run(
+                cmd, cwd=project_dir, capture_output=True, text=True,
+                timeout=timeout,
+            )
+            if result.returncode != 0:
+                logger.error(
+                    "%s failed (rc=%d): %s",
+                    label, result.returncode,
+                    result.stderr[-500:] if result.stderr else "",
+                )
+                raise RuntimeError(f"Vagrant rebuild failed at: {label}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Vagrant rebuild timed out at: {label}")
+
+    logger.info("Vagrant VM rebuilt successfully")
+
+
 # -- VM Provisioning --
 
 def provision_vm(sample_path: Path, project_dir: Path) -> None:
@@ -761,6 +917,14 @@ Examples:
     logger.info("  Workers:    %d", config.num_workers)
     logger.info("  Timeout:    %ds per sample", config.timeout_seconds)
     logger.info("  Base image: %s", config.base_image)
+
+    # Preflight: ensure clean environment
+    try:
+        preflight_check(config.project_dir)
+    except RuntimeError as e:
+        logger.error("Preflight check failed: %s", e)
+        logger.error("Please manually run: vagrant destroy -f && vagrant up --no-provision && vagrant snapshot save 'ready_provision'")
+        sys.exit(1)
 
     try:
         results = run_batch(config)
