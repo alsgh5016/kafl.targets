@@ -474,6 +474,15 @@ def run_kafl(
         cmd.extend(["--image", str(image_path)])
     if qemu_memory is not None:
         cmd.extend(["--memory", str(qemu_memory)])
+
+    # Override qemu_extra to use per-workdir monitor socket and disable VNC.
+    # The default kafl.yaml uses fixed paths (-monitor unix:/tmp/monitor.sock,
+    # -vnc :0) which conflict when multiple QEMU instances run simultaneously.
+    monitor_sock = workdir / "monitor.sock"
+    cmd.extend([
+        "--qemu-extra",
+        f"-monitor unix:{monitor_sock},server,nowait -vnc none",
+    ])
     cmd.extend(extra_args)
 
     logger.info("Running: %s", " ".join(cmd))
