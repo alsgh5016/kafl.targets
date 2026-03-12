@@ -154,18 +154,33 @@ def resolve_kafl_yaml(project_dir: Path) -> KaflYamlConfig:
 
 
 
-def create_standalone_image(base_image: Path, output_path: Path) -> Path:
-    """Create a byte-for-byte copy of the base image.
+QEMU_IMG_CONVERT_TIMEOUT_SECONDS = 600
 
-    Uses cp instead of qemu-img convert to preserve the exact qcow2
-    structure, metadata, and features. This avoids QEMU-Nyx compatibility
-    issues that arise from qemu-img convert producing a restructured image.
+
+def create_standalone_image(base_image: Path, output_path: Path) -> Path:
+    """Create a standalone qcow2 copy with no backing file reference.
+
+    Uses qemu-img convert to flatten the image: removes backing file
+    references and internal snapshots, producing a fully self-contained
+    qcow2 that won't break when vagrant modifies the original.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     start = time.time()
-    logger.info("Copying: %s -> %s", base_image.name, output_path.name)
-    shutil.copy2(str(base_image), str(output_path))
+    cmd = [
+        "qemu-img", "convert",
+        "-f", "qcow2",
+        "-O", "qcow2",
+        str(base_image),
+        str(output_path),
+    ]
+    logger.info("Converting (flatten): %s -> %s", base_image.name, output_path.name)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True,
+        timeout=QEMU_IMG_CONVERT_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"qemu-img convert failed: {result.stderr}")
 
     elapsed = time.time() - start
     size_mb = output_path.stat().st_size / (1024 * 1024)
@@ -173,6 +188,17 @@ def create_standalone_image(base_image: Path, output_path: Path) -> Path:
         "Created standalone image: %s (%.0f MB, %.1fs)",
         output_path.name, size_mb, elapsed,
     )
+
+    # Verify no backing file
+    info_result = subprocess.run(
+        ["qemu-img", "info", "--output=json", str(output_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if info_result.returncode == 0:
+        info = json.loads(info_result.stdout)
+        if "backing-filename" in info:
+            logger.error("WARNING: standalone image still has backing file: %s", info["backing-filename"])
+
     return output_path
 
 
