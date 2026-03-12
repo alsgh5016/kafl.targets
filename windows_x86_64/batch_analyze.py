@@ -3,8 +3,8 @@
 Batch PE Unpacking Analyzer for kAFL.
 
 Automates parallel kAFL unpacking analysis across multiple packed PE samples.
-Uses qcow2 COW overlays so multiple VMs can run simultaneously from the same
-base disk image.
+Creates standalone qcow2 copies of the provisioned disk image so multiple
+VMs can run simultaneously without file locking conflicts.
 
 Usage:
     python3 batch_analyze.py /path/to/samples_dir -o ./results -t 600 -n 2
@@ -49,11 +49,15 @@ class SampleStatus(enum.Enum):
     SKIPPED = "skipped"
 
 
+QEMU_IMG_CONVERT_TIMEOUT_SECONDS = 600
+
+
 @dataclass(frozen=True)
 class BatchConfig:
     samples_dir: Path
     output_dir: Path
     workdir_base: Path
+    image_dir: Path
     timeout_seconds: int
     project_dir: Path
     force: bool
@@ -134,38 +138,53 @@ def resolve_base_image(project_dir: Path) -> Path:
     raise ValueError("qemu_image not found in kafl.yaml")
 
 
-def create_overlay(base_image: Path, overlay_path: Path) -> Path:
-    """Create a qcow2 COW overlay on top of the base image."""
-    overlay_path.parent.mkdir(parents=True, exist_ok=True)
+def create_standalone_image(base_image: Path, output_path: Path) -> Path:
+    """Create a standalone qcow2 copy of the base image.
+
+    Unlike a thin overlay, this copy does NOT reference the base image,
+    so vagrant can freely modify the base for the next sample while
+    QEMU uses this copy for analysis.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Detect base image format
     base_format = "raw"
     if base_image.suffix in (".qcow2", ".qcow"):
         base_format = "qcow2"
 
+    start = time.time()
     cmd = [
-        "qemu-img", "create",
-        "-f", "qcow2",
-        "-b", str(base_image),
-        "-F", base_format,
-        str(overlay_path),
+        "qemu-img", "convert",
+        "-f", base_format,
+        "-O", "qcow2",
+        str(base_image),
+        str(output_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True,
+        timeout=QEMU_IMG_CONVERT_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
-        raise RuntimeError(f"qemu-img create failed: {result.stderr}")
+        raise RuntimeError(f"qemu-img convert failed: {result.stderr}")
 
-    logger.debug("Created overlay: %s -> %s", overlay_path.name, base_image.name)
-    return overlay_path
+    elapsed = time.time() - start
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    logger.info(
+        "Created standalone image: %s (%.0f MB, %.1fs)",
+        output_path.name, size_mb, elapsed,
+    )
+    return output_path
 
 
-def remove_overlay(overlay_path: Path) -> None:
-    """Remove a qcow2 overlay file."""
+def remove_worker_image(image_path: Path) -> None:
+    """Remove a standalone qcow2 worker image."""
     try:
-        if overlay_path.exists():
-            overlay_path.unlink()
-            logger.debug("Removed overlay: %s", overlay_path.name)
+        if image_path.exists():
+            size_mb = image_path.stat().st_size / (1024 * 1024)
+            image_path.unlink()
+            logger.debug("Removed worker image: %s (%.0f MB freed)", image_path.name, size_mb)
     except OSError as e:
-        logger.debug("Failed to remove overlay %s: %s", overlay_path, e)
+        logger.debug("Failed to remove image %s: %s", image_path, e)
 
 
 # -- VM Provisioning --
@@ -381,24 +400,28 @@ def process_sample(
     start_time = time.time()
     result: Optional[SampleResult] = None
     worker_workdir = config.workdir_base / sample_name
-    overlay_path = config.workdir_base / f"{sample_name}.qcow2"
+    image_path = config.image_dir / f"{sample_name}.qcow2"
 
     try:
-        # Phase 1+2: Provision + create overlay (serialized)
+        # Phase 1+2: Provision + create standalone image (serialized)
+        # Lock ensures only one thread uses vagrant at a time, and the
+        # base image is free (no QEMU has it open as a backing file).
         with _provision_lock:
             logger.info("[PROVISION] %s: provisioning VM...", sample_name)
             provision_vm(sample_path, config.project_dir)
 
-            logger.info("[PROVISION] %s: creating disk overlay...", sample_name)
-            create_overlay(config.base_image, overlay_path)
+            logger.info("[PROVISION] %s: creating standalone disk image...", sample_name)
+            create_standalone_image(config.base_image, image_path)
 
         # Phase 3: Run kAFL analysis (parallel)
+        # The standalone qcow2 has no backing file reference, so it
+        # doesn't lock the base image — vagrant can provision the next sample.
         logger.info("[ANALYZE] %s: starting kAFL...", sample_name)
         run_kafl(
             worker_workdir,
             config.project_dir,
             config.timeout_seconds,
-            image_path=overlay_path,
+            image_path=image_path,
             extra_args=config.kafl_extra_args,
         )
 
@@ -452,7 +475,7 @@ def process_sample(
             )
         if worker_workdir.exists():
             collect_results(worker_workdir, config.output_dir, sample_name, result)
-        remove_overlay(overlay_path)
+        remove_worker_image(image_path)
         _cleanup_kafl(worker_workdir)
 
         with _progress_lock:
@@ -680,6 +703,8 @@ Examples:
                         help="Output directory for results (default: ./batch_results)")
     parser.add_argument("-w", "--workdir", type=Path, default=Path("/dev/shm/kafl_batch"),
                         help="Base kAFL working directory (default: /dev/shm/kafl_batch)")
+    parser.add_argument("--image-dir", type=Path, default=None,
+                        help="Directory for standalone disk images (default: next to base image)")
     parser.add_argument("-t", "--timeout", type=int, default=600,
                         help="Per-sample timeout in seconds (default: 600)")
     parser.add_argument("--force", action="store_true",
@@ -709,10 +734,18 @@ Examples:
         logger.error("Failed to resolve base image: %s", e)
         sys.exit(1)
 
+    # Default image_dir: same directory as the base image
+    image_dir = args.image_dir
+    if image_dir is None:
+        image_dir = base_image.parent / "batch_images"
+    image_dir = image_dir.resolve()
+    image_dir.mkdir(parents=True, exist_ok=True)
+
     config = BatchConfig(
         samples_dir=args.samples_dir.resolve(),
         output_dir=args.output_dir.resolve(),
         workdir_base=args.workdir.resolve(),
+        image_dir=image_dir,
         timeout_seconds=args.timeout,
         project_dir=project_dir,
         force=args.force,
@@ -724,6 +757,7 @@ Examples:
     logger.info("  Samples:    %s", config.samples_dir)
     logger.info("  Output:     %s", config.output_dir)
     logger.info("  Workdir:    %s", config.workdir_base)
+    logger.info("  Image dir:  %s", config.image_dir)
     logger.info("  Workers:    %d", config.num_workers)
     logger.info("  Timeout:    %ds per sample", config.timeout_seconds)
     logger.info("  Base image: %s", config.base_image)
