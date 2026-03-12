@@ -402,8 +402,10 @@ def provision_vm(sample_path: Path, project_dir: Path) -> None:
         label="make provision_unpack",
     )
 
+    # Clean shutdown (not -f) is required: forced poweroff leaves qcow2
+    # in a dirty state that prevents QEMU-Nyx from booting successfully.
     _run_cmd(
-        ["vagrant", "halt", "-f"],
+        ["vagrant", "halt"],
         cwd=project_dir,
         timeout=VAGRANT_HALT_TIMEOUT_SECONDS,
         label="vagrant halt",
