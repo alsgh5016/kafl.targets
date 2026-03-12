@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 """
-Batch PE Unpacking Analyzer for kAFL.
+Batch PE Unpacking Analyzer - Independent Worker Pool Architecture.
 
-Automates parallel kAFL unpacking analysis across multiple packed PE samples.
-Creates standalone qcow2 copies of the provisioned disk image so multiple
-VMs can run simultaneously without file locking conflicts.
+Each worker has its own vagrant VM and disk image, enabling fully parallel
+provisioning and analysis with complete fault isolation.
 
 Usage:
-    python3 batch_analyze.py /path/to/samples_dir -o ./results -t 600 -n 2
+    # One-time: compile harness and create 4 worker VMs
+    make compile
+    python3 batch_analyze.py setup -n 4
+
+    # Run batch analysis
+    python3 batch_analyze.py run /path/to/samples -o ./results -t 600
+
+    # Check worker status
+    python3 batch_analyze.py status
+
+    # Tear down all workers
+    python3 batch_analyze.py teardown
 """
 
 import argparse
-import concurrent.futures
 import enum
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
@@ -30,16 +40,72 @@ from typing import Optional
 
 logger = logging.getLogger("batch_analyze")
 
+# -- Constants --
+
 PE_EXTENSIONS = {".exe", ".dll", ".scr", ".sys"}
-PROVISION_TIMEOUT_SECONDS = 300
-VAGRANT_HALT_TIMEOUT_SECONDS = 120
-CLEANUP_HALT_TIMEOUT_SECONDS = 60
-SIGTERM_GRACE_SECONDS = 3
+WORKERS_DIR = "workers"
+WORKERS_CONFIG = "workers.json"
+PROVISION_TIMEOUT = 300
+HALT_TIMEOUT = 120
+SIGTERM_GRACE = 3
+MAX_CONSECUTIVE_FAILURES = 5
 HPRINTF_SUCCESS_MARKERS = [
     "WtE single execution complete",
     "Unpacking complete",
     "Single execution complete",
 ]
+
+# Vagrantfile template for worker VMs.
+# Worker ID is derived from directory name (worker0 -> "0").
+# All Ruby #{} interpolations pass through Python unchanged.
+VAGRANTFILE_TEMPLATE = """\
+# Auto-generated for kAFL batch analysis worker.
+WORKER_ID = File.basename(__dir__).sub('worker', '')
+TARGET = ENV['TARGET_HARNESS'] || 'userspace'
+WORKER_DIR = File.expand_path(__dir__)
+PROJECT_DIR = File.expand_path('../..', WORKER_DIR)
+ROOT_DIR = File.expand_path('../../..', WORKER_DIR)
+
+Vagrant.configure("2") do |config|
+    config.vm.box = "kafl_windows"
+    config.vm.define "kafl-worker-#{WORKER_ID}"
+
+    config.vm.synced_folder ".", "/vagrant", disabled: true
+
+    config.trigger.before :up do |trigger|
+        trigger.info = "Unset HTTP_PROXY"
+        ENV['HTTP_PROXY'] = nil
+        ENV['HTTPS_PROXY'] = nil
+        ENV['http_proxy'] = nil
+        ENV['https_proxy'] = nil
+    end
+
+    config.vm.provider :libvirt do |libvirt|
+        libvirt.uri = "qemu:///session"
+        libvirt.graphics_type = "spice"
+        libvirt.cpus = 4
+        libvirt.cputopology :sockets => '1', :cores => '4', :threads => '1'
+        libvirt.memory = 4096
+    end
+
+    config.trigger.after :provision do |trigger|
+        trigger.info = "Provisioning worker #{WORKER_ID}"
+        trigger.run = {inline: "bash -c 'source #{ROOT_DIR}/venv/bin/activate && cd #{WORKER_DIR} && #{PROJECT_DIR}/setup_target.sh -e target_harness=#{TARGET} -e bin_src=#{WORKER_DIR}/bin'"}
+    end
+end
+"""
+
+# -- Graceful shutdown --
+
+_shutdown = threading.Event()
+
+
+def _signal_handler(_sig, _frame):
+    logger.info("Shutdown requested, finishing current samples...")
+    _shutdown.set()
+
+
+# -- Enums & Dataclasses --
 
 
 class SampleStatus(enum.Enum):
@@ -49,19 +115,23 @@ class SampleStatus(enum.Enum):
     SKIPPED = "skipped"
 
 
+@dataclass(frozen=True)
+class WorkerInfo:
+    worker_id: int
+    worker_dir: Path
+    vm_name: str
+    disk_image: Path
+
 
 @dataclass(frozen=True)
 class BatchConfig:
     samples_dir: Path
     output_dir: Path
     workdir_base: Path
-    image_dir: Path
     timeout_seconds: int
     project_dir: Path
     force: bool
-    num_workers: int
-    base_image: Path
-    qemu_memory: int = 4096
+    qemu_memory: int
     kafl_extra_args: tuple[str, ...] = ()
 
 
@@ -70,25 +140,27 @@ class SampleResult:
     sample_name: str
     status: SampleStatus
     duration_seconds: float
+    worker_id: int = -1
     error_message: Optional[str] = None
     wte_count: Optional[int] = None
     dump_file_count: int = 0
 
 
-# -- Discovery & Resume --
+# -- Sample Discovery --
+
 
 def discover_samples(samples_dir: Path) -> list[Path]:
     """Find all PE files in the samples directory, sorted alphabetically."""
-    resolved_dir = samples_dir.resolve()
-    if not resolved_dir.is_dir():
-        raise FileNotFoundError(f"Samples directory not found: {resolved_dir}")
+    resolved = samples_dir.resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Samples directory not found: {resolved}")
 
     samples = []
-    for entry in sorted(resolved_dir.iterdir()):
+    for entry in sorted(resolved.iterdir()):
         if entry.is_symlink():
             real = entry.resolve()
-            if not real.is_relative_to(resolved_dir):
-                logger.warning("Skipping symlink escaping samples dir: %s", entry.name)
+            if not real.is_relative_to(resolved):
+                logger.warning("Skipping symlink escaping dir: %s", entry.name)
                 continue
         if entry.is_file() and entry.suffix.lower() in PE_EXTENSIONS:
             if entry.stat().st_size > 0:
@@ -104,7 +176,6 @@ def is_already_processed(sample_path: Path, output_dir: Path) -> bool:
     result_file = output_dir / sample_path.stem / "result.json"
     if not result_file.exists():
         return False
-
     try:
         data = json.loads(result_file.read_text())
         return data.get("status") == SampleStatus.SUCCESS.value
@@ -112,424 +183,322 @@ def is_already_processed(sample_path: Path, output_dir: Path) -> bool:
         return False
 
 
-# -- Disk Image Management --
-
-@dataclass(frozen=True)
-class KaflYamlConfig:
-    base_image: Path
-    qemu_memory: int
+# -- Worker Setup & Teardown --
 
 
-def resolve_kafl_yaml(project_dir: Path) -> KaflYamlConfig:
-    """Read kafl.yaml to find the base disk image path and qemu_memory."""
-    kafl_yaml = project_dir / "kafl.yaml"
-    if not kafl_yaml.exists():
-        raise FileNotFoundError(f"kafl.yaml not found in {project_dir}")
+def setup_workers(project_dir: Path, num_workers: int) -> list[WorkerInfo]:
+    """Create N independent worker VMs with vagrant.
 
-    content = kafl_yaml.read_text()
-    base_image: Optional[Path] = None
-    qemu_memory = 256  # kafl default
-
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("qemu_image:"):
-            value = stripped.split(":", 1)[1].strip().strip("'\"")
-            if "@format" in value:
-                value = value.replace("@format ", "")
-                value = value.replace("{env[HOME]}", os.environ["HOME"])
-            path = Path(value)
-            if not path.exists():
-                raise FileNotFoundError(f"Base image not found: {path}")
-            base_image = path.resolve()
-        elif stripped.startswith("qemu_memory:"):
-            try:
-                qemu_memory = int(stripped.split(":", 1)[1].strip())
-            except ValueError:
-                pass
-
-    if base_image is None:
-        raise ValueError("qemu_image not found in kafl.yaml")
-
-    return KaflYamlConfig(base_image=base_image, qemu_memory=qemu_memory)
-
-
-
-QEMU_IMG_CONVERT_TIMEOUT_SECONDS = 600
-
-
-def create_standalone_image(base_image: Path, output_path: Path) -> Path:
-    """Create a standalone qcow2 copy with no backing file reference.
-
-    Uses qemu-img convert to flatten the image: removes backing file
-    references and internal snapshots, producing a fully self-contained
-    qcow2 that won't break when vagrant modifies the original.
+    Each worker gets its own directory, Vagrantfile, VM, and disk image.
     """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workers_base = project_dir / WORKERS_DIR
+    bin_dir = project_dir / "bin"
 
-    start = time.time()
-    cmd = [
-        "qemu-img", "convert",
-        "-f", "qcow2",
-        "-O", "qcow2",
-        str(base_image),
-        str(output_path),
-    ]
-    logger.info("Converting (flatten): %s -> %s", base_image.name, output_path.name)
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        timeout=QEMU_IMG_CONVERT_TIMEOUT_SECONDS,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"qemu-img convert failed: {result.stderr}")
+    if not (bin_dir / "userspace" / "unpack_harness.exe").exists():
+        raise RuntimeError(
+            "Compiled binaries not found in bin/. Run 'make compile' first."
+        )
 
-    elapsed = time.time() - start
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    logger.info(
-        "Created standalone image: %s (%.0f MB, %.1fs)",
-        output_path.name, size_mb, elapsed,
-    )
+    workers_base.mkdir(parents=True, exist_ok=True)
+    workers: list[WorkerInfo] = []
 
-    # Verify no backing file
-    info_result = subprocess.run(
-        ["qemu-img", "info", "--output=json", str(output_path)],
-        capture_output=True, text=True, timeout=30,
-    )
-    if info_result.returncode == 0:
-        info = json.loads(info_result.stdout)
-        if "backing-filename" in info:
-            logger.error("WARNING: standalone image still has backing file: %s", info["backing-filename"])
+    for i in range(num_workers):
+        logger.info("=" * 50)
+        logger.info("Setting up worker %d/%d...", i + 1, num_workers)
+        worker_dir = workers_base / f"worker{i}"
+        vm_name = f"kafl-worker-{i}"
 
-    return output_path
+        _create_worker_dir(worker_dir, project_dir)
+        _init_worker_vm(worker_dir)
+
+        disk_image = _discover_disk_image(worker_dir, vm_name)
+        logger.info("Worker %d ready: %s (image: %s)", i, vm_name, disk_image)
+
+        workers.append(WorkerInfo(
+            worker_id=i,
+            worker_dir=worker_dir,
+            vm_name=vm_name,
+            disk_image=disk_image,
+        ))
+
+    _save_workers_config(workers_base, workers)
+    return workers
 
 
-def remove_worker_image(image_path: Path, *, keep_on_failure: bool = False) -> None:
-    """Remove a standalone qcow2 worker image.
-
-    Args:
-        image_path: Path to the qcow2 image file.
-        keep_on_failure: If True, skip deletion (keep image for debugging).
-    """
-    if keep_on_failure:
-        logger.info("Keeping worker image for debugging: %s", image_path)
-        return
-    try:
-        if image_path.exists():
-            size_mb = image_path.stat().st_size / (1024 * 1024)
-            image_path.unlink()
-            logger.debug("Removed worker image: %s (%.0f MB freed)", image_path.name, size_mb)
-    except OSError as e:
-        logger.debug("Failed to remove image %s: %s", image_path, e)
-
-
-# -- Environment Preflight Check --
-
-def preflight_check(project_dir: Path) -> None:
-    """Verify environment is clean before starting batch analysis.
-
-    Checks for:
-      1. Stray QEMU processes (from previous kafl runs)
-      2. Vagrant/libvirt VM in unexpected state
-      3. Snapshot 'ready_provision' availability
-
-    If issues are found, attempts automatic recovery:
-      kill QEMU → vagrant destroy → vagrant up → snapshot save
-    """
-    logger.info("Running preflight checks...")
-
-    # 1. Kill any stray QEMU processes
-    stray_qemu = _find_stray_qemu()
-    if stray_qemu:
-        logger.warning("Found %d stray QEMU process(es), killing...", len(stray_qemu))
-        _kill_all_qemu()
-        time.sleep(2)
-
-    # 2. Check vagrant/libvirt state
-    if not _is_vagrant_healthy(project_dir):
-        logger.warning("Vagrant VM is in an unhealthy state, rebuilding...")
-        _rebuild_vagrant(project_dir)
+def _create_worker_dir(worker_dir: Path, project_dir: Path) -> None:
+    """Create worker directory with Vagrantfile, symlinks, and bin/ copy."""
+    if worker_dir.exists():
+        logger.warning("Worker dir already exists: %s", worker_dir)
         return
 
-    # 3. Verify snapshot exists and is restorable
-    if not _test_snapshot_restore(project_dir):
-        logger.warning("Snapshot 'ready_provision' unusable, rebuilding...")
-        _rebuild_vagrant(project_dir)
-        return
+    worker_dir.mkdir(parents=True)
 
-    logger.info("Preflight checks passed")
+    # Write Vagrantfile
+    (worker_dir / "Vagrantfile").write_text(VAGRANTFILE_TEMPLATE)
 
+    # Symlink shared files
+    for name in ["ansible.cfg", "setup_target.sh", "setup_target.yml"]:
+        src = project_dir / name
+        dst = worker_dir / name
+        if src.exists():
+            dst.symlink_to(os.path.relpath(src, worker_dir))
 
-def _find_stray_qemu() -> list[str]:
-    """Find stray QEMU processes."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-af", "qemu-system-x86_64"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().splitlines()
-    except Exception:
-        pass
-    return []
+    # Copy compiled binaries (each worker needs its own bin/ for target_packed.exe)
+    bin_src = project_dir / "bin"
+    bin_dst = worker_dir / "bin"
+    shutil.copytree(bin_src, bin_dst)
+    logger.debug("Created worker dir: %s", worker_dir)
 
 
-def _kill_all_qemu() -> None:
-    """Kill all QEMU processes."""
-    try:
-        subprocess.run(["pkill", "-9", "qemu-system-x86_64"],
-                        capture_output=True, timeout=10)
-    except Exception as e:
-        logger.debug("pkill qemu failed: %s", e)
+def _init_worker_vm(worker_dir: Path) -> None:
+    """Initialize worker VM: vagrant up -> snapshot save -> halt."""
+    _run_cmd(
+        ["vagrant", "up", "--no-provision"],
+        cwd=worker_dir, timeout=600,
+        label="vagrant up",
+    )
+    _run_cmd(
+        ["vagrant", "snapshot", "save", "ready_provision"],
+        cwd=worker_dir, timeout=120,
+        label="vagrant snapshot save",
+    )
+    _run_cmd(
+        ["vagrant", "halt"],
+        cwd=worker_dir, timeout=HALT_TIMEOUT,
+        label="vagrant halt",
+    )
 
 
-def _is_vagrant_healthy(project_dir: Path) -> bool:
-    """Check if vagrant VM is in a usable state."""
-    try:
-        result = subprocess.run(
-            ["vagrant", "status", "--machine-readable"],
-            cwd=project_dir, capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return False
-        # Check for known bad states
-        output = result.stdout
-        # machine-readable format: timestamp,target,type,data
-        for line in output.splitlines():
-            parts = line.split(",")
-            if len(parts) >= 4 and parts[2] == "state":
-                state = parts[3]
-                logger.info("Vagrant VM state: %s", state)
-                # Valid states: shutoff, running, not_created
-                if state in ("shutoff", "not_created"):
-                    return True
-                if state == "running":
-                    # Running is OK, vagrant halt will handle it
-                    return True
-                # paused, crashed, etc. → unhealthy
-                logger.warning("Vagrant VM in unexpected state: %s", state)
-                return False
-        return True
-    except Exception as e:
-        logger.warning("Vagrant status check failed: %s", e)
-        return False
-
-
-def _test_snapshot_restore(project_dir: Path) -> bool:
-    """Test if 'ready_provision' snapshot can be restored."""
-    try:
-        # List snapshots to check if it exists
-        result = subprocess.run(
-            ["vagrant", "snapshot", "list"],
-            cwd=project_dir, capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return False
-        if "ready_provision" not in result.stdout:
-            logger.warning("Snapshot 'ready_provision' not found")
-            return False
-
-        # Try actual restore
-        result = subprocess.run(
-            ["vagrant", "snapshot", "restore", "ready_provision"],
-            cwd=project_dir, capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            logger.warning("Snapshot restore failed: %s", result.stderr[-300:])
-            return False
-
-        # Halt after successful test restore
-        subprocess.run(
-            ["vagrant", "halt", "-f"],
-            cwd=project_dir, capture_output=True, timeout=60,
-        )
-        return True
-    except Exception as e:
-        logger.warning("Snapshot test failed: %s", e)
-        return False
-
-
-def _rebuild_vagrant(project_dir: Path) -> None:
-    """Full rebuild: destroy → up → snapshot save."""
-    logger.info("Rebuilding vagrant VM (this may take a few minutes)...")
-
-    steps = [
-        (["vagrant", "destroy", "-f"], "vagrant destroy", 120),
-        (["vagrant", "up", "--no-provision"], "vagrant up", 600),
-        (["vagrant", "snapshot", "save", "ready_provision"], "snapshot save", 120),
-    ]
-
-    for cmd, label, timeout in steps:
-        logger.info("  Running: %s", label)
+def _discover_disk_image(worker_dir: Path, vm_name: str) -> Path:
+    """Find the libvirt-managed disk image for a worker VM."""
+    # Method 1: vagrant machine ID -> virsh domblklist
+    id_file = worker_dir / ".vagrant" / "machines" / vm_name / "libvirt" / "id"
+    if id_file.exists():
+        domain_id = id_file.read_text().strip()
         try:
             result = subprocess.run(
-                cmd, cwd=project_dir, capture_output=True, text=True,
-                timeout=timeout,
+                ["virsh", "-c", "qemu:///session", "domblklist", domain_id],
+                capture_output=True, text=True, timeout=10,
             )
-            if result.returncode != 0:
-                logger.error(
-                    "%s failed (rc=%d): %s",
-                    label, result.returncode,
-                    result.stderr[-500:] if result.stderr else "",
-                )
-                raise RuntimeError(f"Vagrant rebuild failed at: {label}")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Vagrant rebuild timed out at: {label}")
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and not parts[1].startswith("-"):
+                        path = Path(parts[1])
+                        if path.exists() and path.is_file():
+                            return path
+        except Exception as e:
+            logger.debug("virsh domblklist failed: %s", e)
 
-    logger.info("Vagrant VM rebuilt successfully")
+    # Method 2: search default libvirt image directories
+    dir_name = worker_dir.name
+    search_dirs = [
+        Path.home() / ".local" / "share" / "libvirt" / "images",
+        Path("/var/lib/libvirt/images"),
+    ]
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for candidate in search_dir.glob(f"{dir_name}_{vm_name}*"):
+            if candidate.is_file():
+                return candidate
+
+    raise RuntimeError(
+        f"Could not discover disk image for {vm_name}. "
+        f"Run: virsh -c qemu:///session domblklist {vm_name}"
+    )
 
 
-# -- VM Provisioning --
+def _save_workers_config(workers_base: Path, workers: list[WorkerInfo]) -> None:
+    """Save worker config to workers.json."""
+    config_data = {
+        "workers": [
+            {
+                "worker_id": w.worker_id,
+                "worker_dir": str(w.worker_dir),
+                "vm_name": w.vm_name,
+                "disk_image": str(w.disk_image),
+            }
+            for w in workers
+        ],
+    }
+    config_path = workers_base / WORKERS_CONFIG
+    config_path.write_text(json.dumps(config_data, indent=2) + "\n")
+    logger.info("Workers config: %s", config_path)
 
-def provision_vm(sample_path: Path, project_dir: Path) -> None:
-    """Copy sample to bin/ and provision the VM via Makefile."""
-    target_path = project_dir / "bin" / "userspace" / "target_packed.exe"
-    target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    shutil.copy2(sample_path, target_path)
-    logger.info("Copied %s -> target_packed.exe", sample_path.name)
+def load_workers(project_dir: Path) -> list[WorkerInfo]:
+    """Load worker config from workers.json with path validation."""
+    config_path = project_dir / WORKERS_DIR / WORKERS_CONFIG
+    if not config_path.exists():
+        raise FileNotFoundError(
+            "Workers not set up. Run 'python3 batch_analyze.py setup' first."
+        )
 
-    # Ensure no stale vagrant lock from a previous failed cycle
-    _cleanup_vagrant_lock(project_dir)
+    workers_base = (project_dir / WORKERS_DIR).resolve()
+    data = json.loads(config_path.read_text())
+    workers: list[WorkerInfo] = []
 
-    # Provision with retry: vagrant networking can be flaky when another
-    # QEMU instance is running (parallel analysis). Retry up to 3 times
-    # with increasing delay.
-    max_retries = 3
+    for w in data["workers"]:
+        worker_dir = Path(w["worker_dir"]).resolve()
+        disk_image = Path(w["disk_image"])
+
+        # Validate worker_dir is under workers/ directory
+        if not worker_dir.is_relative_to(workers_base):
+            raise ValueError(
+                f"worker_dir escapes workers base: {worker_dir}"
+            )
+        if not disk_image.is_file():
+            raise FileNotFoundError(f"Disk image missing: {disk_image}")
+
+        workers.append(WorkerInfo(
+            worker_id=w["worker_id"],
+            worker_dir=worker_dir,
+            vm_name=w["vm_name"],
+            disk_image=disk_image,
+        ))
+
+    return workers
+
+
+def teardown_workers(project_dir: Path) -> None:
+    """Destroy all worker VMs and remove directories."""
+    workers_base = project_dir / WORKERS_DIR
+    if not workers_base.exists():
+        logger.info("No workers directory found")
+        return
+
+    try:
+        workers = load_workers(project_dir)
+    except (FileNotFoundError, json.JSONDecodeError):
+        workers = []
+
+    destroy_failures = []
+    for w in workers:
+        logger.info("Destroying worker %d (%s)...", w.worker_id, w.vm_name)
+        try:
+            subprocess.run(
+                ["vagrant", "destroy", "-f"],
+                cwd=w.worker_dir, capture_output=True, text=True, timeout=120,
+            )
+        except Exception as e:
+            logger.warning("Failed to destroy worker %d: %s", w.worker_id, e)
+            destroy_failures.append(w)
+
+    if destroy_failures:
+        logger.warning(
+            "Some VMs may be orphaned in libvirt. "
+            "Run 'virsh -c qemu:///session list --all' to check, "
+            "and 'virsh -c qemu:///session undefine <name>' to clean up."
+        )
+
+    shutil.rmtree(workers_base)
+    logger.info("All workers removed")
+
+
+# -- Worker Operations --
+
+
+def provision_sample(worker: WorkerInfo, sample_path: Path) -> None:
+    """Provision a worker VM with a specific sample.
+
+    Flow: copy PE -> snapshot restore -> ansible provision -> halt.
+    """
+    target = worker.worker_dir / "bin" / "userspace" / "target_packed.exe"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(sample_path, target)
+    logger.debug(
+        "[W%d] Copied %s -> target_packed.exe", worker.worker_id, sample_path.name
+    )
+
+    # Restore snapshot (boots VM to clean state)
+    max_retries = 2
     for attempt in range(1, max_retries + 1):
         try:
             _run_cmd(
-                ["make", "provision_unpack"],
-                cwd=project_dir,
-                timeout=PROVISION_TIMEOUT_SECONDS,
-                label="make provision_unpack",
+                ["vagrant", "snapshot", "restore", "ready_provision"],
+                cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
+                label=f"W{worker.worker_id} snapshot restore",
             )
             break
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             if attempt == max_retries:
                 raise
-            delay = attempt * 15
             logger.warning(
-                "Provision attempt %d/%d failed, retrying in %ds...",
-                attempt, max_retries, delay,
+                "[W%d] Snapshot restore failed, retrying...", worker.worker_id
             )
-            # Force halt and cleanup before retry
-            _halt_vagrant(project_dir)
-            _cleanup_vagrant_lock(project_dir)
-            time.sleep(delay)
+            _halt_worker(worker)
+            time.sleep(5)
 
-    # Clean shutdown preserves qcow2 disk state for QEMU-Nyx.
-    # Fall back to forced halt if guest communication fails (e.g. WinRM down).
-    _halt_vagrant(project_dir)
+    # Provision (ansible uploads bin/ and creates startup shortcut)
+    env = {**os.environ, "TARGET_HARNESS": "unpack"}
+    _run_cmd(
+        ["vagrant", "provision"],
+        cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
+        label=f"W{worker.worker_id} provision",
+        env=env,
+    )
+
+    # Clean halt preserves disk state for QEMU-Nyx
+    _halt_worker(worker)
 
 
-def _halt_vagrant(project_dir: Path) -> None:
-    """Halt vagrant VM: try clean shutdown, fall back to forced halt."""
+def _halt_worker(worker: WorkerInfo) -> None:
+    """Halt worker VM: clean shutdown with forced fallback."""
     try:
         result = subprocess.run(
             ["vagrant", "halt"],
-            cwd=project_dir, capture_output=True, text=True,
-            timeout=VAGRANT_HALT_TIMEOUT_SECONDS,
+            cwd=worker.worker_dir, capture_output=True, text=True,
+            timeout=HALT_TIMEOUT,
         )
         if result.returncode == 0:
             return
-        logger.warning(
-            "Clean vagrant halt failed (rc=%d), falling back to forced halt",
-            result.returncode,
-        )
+        logger.warning("[W%d] Clean halt failed, forcing", worker.worker_id)
     except subprocess.TimeoutExpired:
-        logger.warning("Clean vagrant halt timed out, falling back to forced halt")
+        logger.warning("[W%d] Clean halt timed out, forcing", worker.worker_id)
 
-    # Force halt as fallback
     try:
         subprocess.run(
             ["vagrant", "halt", "-f"],
-            cwd=project_dir, capture_output=True, text=True,
+            cwd=worker.worker_dir, capture_output=True, text=True,
             timeout=60,
         )
     except Exception as e:
-        logger.warning("Forced vagrant halt also failed: %s", e)
-
-    # Clean up stale vagrant lock if needed
-    _cleanup_vagrant_lock(project_dir)
-
-
-def _cleanup_vagrant_lock(project_dir: Path) -> None:
-    """Kill stale vagrant/ruby processes that hold the machine lock."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-af", "vagrant"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            stale = result.stdout.strip().splitlines()
-            logger.warning("Found %d stale vagrant process(es), killing...", len(stale))
-            subprocess.run(["pkill", "-9", "-f", "vagrant"], capture_output=True, timeout=10)
-            time.sleep(1)
-    except Exception as e:
-        logger.debug("Vagrant lock cleanup failed: %s", e)
-
-
-def _run_cmd(
-    cmd: list[str],
-    cwd: Path,
-    timeout: int,
-    label: str,
-) -> subprocess.CompletedProcess:
-    """Run a subprocess with timeout and logging."""
-    logger.debug("Running: %s (timeout=%ds)", " ".join(cmd), timeout)
-    try:
-        result = subprocess.run(
-            cmd, cwd=cwd, timeout=timeout,
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            logger.error(
-                "%s failed (rc=%d):\nstdout: %s\nstderr: %s",
-                label, result.returncode,
-                result.stdout[-500:] if result.stdout else "",
-                result.stderr[-500:] if result.stderr else "",
-            )
-            raise subprocess.CalledProcessError(
-                result.returncode, cmd, result.stdout, result.stderr,
-            )
-        return result
-    except subprocess.TimeoutExpired:
-        logger.error("%s timed out after %ds", label, timeout)
-        raise
+        logger.warning("[W%d] Forced halt failed: %s", worker.worker_id, e)
 
 
 # -- kAFL Execution --
 
+
 def run_kafl(
     workdir: Path,
     project_dir: Path,
+    worker: WorkerInfo,
     timeout: int,
-    image_path: Optional[Path] = None,
-    qemu_memory: Optional[int] = None,
+    qemu_memory: int,
     extra_args: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
-    """Run kafl fuzz and wait for completion or timeout."""
+    """Run kafl fuzz with a worker's disk image."""
+    workdir.mkdir(parents=True, exist_ok=True)
+
     cmd = [
         "kafl", "fuzz",
         "--purge",
         "-w", str(workdir),
         "--log-hprintf",
         "-p", "1",
+        "--image", str(worker.disk_image),
+        "--memory", str(qemu_memory),
     ]
-    if image_path is not None:
-        cmd.extend(["--image", str(image_path)])
-    if qemu_memory is not None:
-        cmd.extend(["--memory", str(qemu_memory)])
 
-    # Override qemu_extra to use per-workdir monitor socket and disable VNC.
-    # The default kafl.yaml uses fixed paths (-monitor unix:/tmp/monitor.sock,
-    # -vnc :0) which conflict when multiple QEMU instances run simultaneously.
+    # Per-worker monitor socket and VNC disabled to avoid conflicts
     monitor_sock = workdir / "monitor.sock"
     qemu_extra = f"-monitor unix:{monitor_sock},server,nowait -vnc none"
     cmd.append(f"--qemu-extra={qemu_extra}")
     cmd.extend(extra_args)
 
-    logger.info("Running: %s", " ".join(cmd))
-    start_time = time.time()
+    logger.info("[W%d] kafl: %s", worker.worker_id, " ".join(cmd))
+    start = time.time()
 
     proc = subprocess.Popen(
         cmd, cwd=project_dir,
@@ -540,7 +509,7 @@ def run_kafl(
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        logger.warning("kAFL timed out after %ds, killing process tree...", timeout)
+        logger.warning("[W%d] kafl timed out after %ds", worker.worker_id, timeout)
         _kill_process_tree(proc)
         try:
             stdout, stderr = proc.communicate(timeout=10)
@@ -549,21 +518,21 @@ def run_kafl(
             stdout, stderr = proc.communicate()
         raise subprocess.TimeoutExpired(cmd, timeout, stdout, stderr)
 
-    elapsed = time.time() - start_time
-    logger.debug("kAFL exited with rc=%d after %.1fs", proc.returncode, elapsed)
+    elapsed = time.time() - start
 
-    # Log output on failure OR suspiciously fast exit (under 30s)
-    should_log = proc.returncode != 0 or elapsed < 30
-    if should_log:
-        level = "ERROR" if proc.returncode != 0 else "WARNING"
+    # Log output on failure or suspiciously fast exit
+    if proc.returncode != 0 or elapsed < 30:
         log_fn = logger.error if proc.returncode != 0 else logger.warning
-        log_fn("kAFL %s (rc=%d, %.1fs)", "failed" if proc.returncode != 0 else "exited too quickly", proc.returncode, elapsed)
-        if stdout and stdout.strip():
-            for line in stdout.strip().splitlines()[-30:]:
+        log_fn(
+            "[W%d] kafl rc=%d (%.1fs)", worker.worker_id, proc.returncode, elapsed
+        )
+        if stdout:
+            for line in stdout.strip().splitlines()[-20:]:
                 log_fn("  stdout: %s", line)
-        if stderr and stderr.strip():
-            for line in stderr.strip().splitlines()[-30:]:
+        if stderr:
+            for line in stderr.strip().splitlines()[-20:]:
                 log_fn("  stderr: %s", line)
+
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
@@ -573,7 +542,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGTERM)
         try:
-            proc.wait(timeout=SIGTERM_GRACE_SECONDS)
+            proc.wait(timeout=SIGTERM_GRACE)
         except subprocess.TimeoutExpired:
             os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
@@ -582,8 +551,9 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
 
 # -- Result Validation & Collection --
 
+
 def validate_results(workdir: Path) -> tuple[bool, int, Optional[int]]:
-    """Check if analysis completed successfully by parsing hprintf log."""
+    """Check analysis results by parsing hprintf log."""
     hprintf_log = workdir / "hprintf_00.log"
     success = False
     wte_count = None
@@ -595,7 +565,6 @@ def validate_results(workdir: Path) -> tuple[bool, int, Optional[int]]:
             if marker in content:
                 success = True
                 break
-
         match = re.search(r"WtE count:\s*(\d+)", content)
         if match:
             wte_count = int(match.group(1))
@@ -617,15 +586,13 @@ def collect_results(
     sample_out = output_dir / sample_name
     sample_out.mkdir(parents=True, exist_ok=True)
 
-    collect_items = [
+    for name, is_dir in [
         ("hprintf_00.log", False),
         ("pt_trace_dump_0", False),
         ("dump", True),
         ("traces", True),
         ("logs", True),
-    ]
-
-    for name, is_dir in collect_items:
+    ]:
         src = workdir / name
         dst = sample_out / name
         if not src.exists():
@@ -641,6 +608,7 @@ def collect_results(
         "sample_name": result.sample_name,
         "status": result.status.value,
         "duration_seconds": round(result.duration_seconds, 1),
+        "worker_id": result.worker_id,
         "error_message": result.error_message,
         "wte_count": result.wte_count,
         "dump_file_count": result.dump_file_count,
@@ -649,106 +617,94 @@ def collect_results(
     (sample_out / "result.json").write_text(
         json.dumps(result_data, indent=2) + "\n"
     )
-
-    logger.info("Results saved to %s", sample_out)
     return sample_out
+
+
+def _safe_validate(workdir: Path) -> tuple[bool, int, Optional[int]]:
+    """Validate results, returning defaults on any error."""
+    try:
+        if workdir.exists():
+            return validate_results(workdir)
+    except Exception as exc:
+        logger.debug("validate_results failed for %s: %s", workdir, exc)
+    return False, 0, None
+
+
+def _cleanup_kafl(workdir: Path) -> None:
+    """Kill stray QEMU processes scoped to a workdir."""
+    try:
+        pattern = f"qemu-system-x86_64.*{re.escape(str(workdir))}"
+        subprocess.run(["pkill", "-f", pattern], timeout=10, capture_output=True)
+    except Exception as exc:
+        logger.debug("pkill cleanup failed (non-critical): %s", exc)
 
 
 # -- Single Sample Processing --
 
-# Lock to serialize vagrant provisioning (single disk image + single vagrant VM)
-_provision_lock = threading.Lock()
-
-# Counter for progress logging
-_progress_counter = {"done": 0}
-_progress_lock = threading.Lock()
-
 
 def process_sample(
     sample_path: Path,
+    worker: WorkerInfo,
     config: BatchConfig,
-    total: int,
 ) -> SampleResult:
-    """Process a single packed PE sample end-to-end.
+    """Process one PE sample on a specific worker.
 
-    Pipeline:
-      1. [LOCKED] Provision VM with this sample's PE binary
-      2. [LOCKED] Create qcow2 overlay of the provisioned disk image
-      3. [UNLOCKED] Run kAFL with the overlay (parallel with other workers)
-      4. Collect results, cleanup overlay
+    Pipeline: provision VM -> run kafl -> validate -> collect results.
     """
     sample_name = sample_path.stem
-    start_time = time.time()
+    start = time.time()
+    workdir = config.workdir_base / f"w{worker.worker_id}"
     result: Optional[SampleResult] = None
-    worker_workdir = config.workdir_base / sample_name
-    image_path = config.image_dir / f"{sample_name}.qcow2"
 
     try:
-        # Phase 1+2: Provision + create standalone image (serialized)
-        # Lock ensures only one thread uses vagrant at a time, and the
-        # base image is free (no QEMU has it open as a backing file).
-        with _provision_lock:
-            logger.info("[PROVISION] %s: provisioning VM...", sample_name)
-            provision_vm(sample_path, config.project_dir)
+        # Phase 1: Provision worker VM with this sample
+        logger.info("[W%d] Provisioning: %s", worker.worker_id, sample_name)
+        provision_sample(worker, sample_path)
 
-            logger.info("[PROVISION] %s: creating standalone disk image...", sample_name)
-            create_standalone_image(config.base_image, image_path)
-
-        # Phase 3: Run kAFL analysis (parallel)
-        # The standalone qcow2 has no backing file reference, so it
-        # doesn't lock the base image — vagrant can provision the next sample.
-        if not image_path.exists():
-            raise FileNotFoundError(f"Standalone image missing before kafl: {image_path}")
-        logger.info(
-            "[ANALYZE] %s: starting kAFL (image: %s, %.0f MB)...",
-            sample_name, image_path.name,
-            image_path.stat().st_size / (1024 * 1024),
-        )
+        # Phase 2: Run kAFL analysis
+        logger.info("[W%d] Analyzing: %s", worker.worker_id, sample_name)
         run_kafl(
-            worker_workdir,
-            config.project_dir,
-            config.timeout_seconds,
-            image_path=image_path,
-            qemu_memory=config.qemu_memory,
-            extra_args=config.kafl_extra_args,
+            workdir, config.project_dir, worker,
+            config.timeout_seconds, config.qemu_memory,
+            config.kafl_extra_args,
         )
 
-        # Phase 4: Validate
-        success, dump_count, wte_count = validate_results(worker_workdir)
-        duration = time.time() - start_time
-
-        status = SampleStatus.SUCCESS if success else SampleStatus.ERROR
-        error_msg = None if success else "No success marker in hprintf log"
+        # Phase 3: Validate
+        success, dump_count, wte_count = validate_results(workdir)
+        duration = time.time() - start
 
         result = SampleResult(
             sample_name=sample_name,
-            status=status,
+            status=SampleStatus.SUCCESS if success else SampleStatus.ERROR,
             duration_seconds=duration,
-            error_message=error_msg,
+            worker_id=worker.worker_id,
+            error_message=None if success else "No success marker in hprintf log",
             wte_count=wte_count,
             dump_file_count=dump_count,
         )
 
     except subprocess.TimeoutExpired:
-        duration = time.time() - start_time
-        _, dump_count, wte_count = _safe_validate(worker_workdir)
+        duration = time.time() - start
+        _, dump_count, wte_count = _safe_validate(workdir)
         result = SampleResult(
             sample_name=sample_name,
             status=SampleStatus.TIMEOUT,
             duration_seconds=duration,
+            worker_id=worker.worker_id,
             error_message=f"Timed out after {config.timeout_seconds}s",
             wte_count=wte_count,
             dump_file_count=dump_count,
         )
 
     except Exception as e:
-        duration = time.time() - start_time
-        logger.error("[ERROR] %s: %s", sample_name, e)
-        _, dump_count, wte_count = _safe_validate(worker_workdir)
+        duration = time.time() - start
+        logger.error("[W%d] Error processing %s: %s", worker.worker_id, sample_name, e)
+        _, dump_count, wte_count = _safe_validate(workdir)
         result = SampleResult(
             sample_name=sample_name,
             status=SampleStatus.ERROR,
             duration_seconds=duration,
+            worker_id=worker.worker_id,
             error_message=str(e),
             wte_count=wte_count,
             dump_file_count=dump_count,
@@ -759,97 +715,142 @@ def process_sample(
             result = SampleResult(
                 sample_name=sample_name,
                 status=SampleStatus.ERROR,
-                duration_seconds=time.time() - start_time,
+                duration_seconds=time.time() - start,
+                worker_id=worker.worker_id,
                 error_message="Interrupted",
             )
-        if worker_workdir.exists():
-            collect_results(worker_workdir, config.output_dir, sample_name, result)
-        is_failure = result is not None and result.status != SampleStatus.SUCCESS
-        remove_worker_image(image_path, keep_on_failure=is_failure)
-        _cleanup_kafl(worker_workdir)
-
-        with _progress_lock:
-            _progress_counter["done"] += 1
-            done = _progress_counter["done"]
-
-        status_icon = {
-            SampleStatus.SUCCESS: "OK",
-            SampleStatus.TIMEOUT: "TIMEOUT",
-            SampleStatus.ERROR: "FAIL",
-        }.get(result.status, "?")
-
-        logger.info(
-            "[%d/%d] %s -> %s (%.1fs, WtE=%s, dumps=%d)",
-            done, total, sample_name, status_icon,
-            result.duration_seconds,
-            result.wte_count if result.wte_count is not None else "?",
-            result.dump_file_count,
-        )
+        if workdir.exists():
+            collect_results(workdir, config.output_dir, sample_name, result)
+        _cleanup_kafl(workdir)
 
     return result
 
 
-def _safe_validate(workdir: Path) -> tuple[bool, int, Optional[int]]:
-    """Validate results, returning defaults on any error."""
-    try:
-        if workdir.exists():
-            return validate_results(workdir)
-    except Exception:
-        logger.debug("validate_results failed for %s", workdir, exc_info=True)
-    return False, 0, None
+# -- Worker Loop & Batch Orchestration --
 
 
-def _cleanup_kafl(workdir: Path) -> None:
-    """Kill stray QEMU processes scoped to a specific workdir."""
-    try:
-        pattern = f"qemu-system-x86_64.*{re.escape(str(workdir))}"
-        subprocess.run(
-            ["pkill", "-f", pattern],
-            timeout=10, capture_output=True,
-        )
-    except Exception as e:
-        logger.debug("pkill failed (non-critical): %s", e)
+@dataclass
+class BatchProgress:
+    """Thread-safe progress counter for batch processing."""
+
+    done: int = 0
+    success: int = 0
+    fail: int = 0
+    lock: threading.Lock = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.lock = threading.Lock()
+
+    def record(self, status: SampleStatus) -> tuple[int, int, int]:
+        """Record a result and return (done, success, fail) snapshot."""
+        with self.lock:
+            self.done += 1
+            if status == SampleStatus.SUCCESS:
+                self.success += 1
+            else:
+                self.fail += 1
+            return self.done, self.success, self.fail
 
 
-def cleanup_all(project_dir: Path) -> None:
-    """Force-halt vagrant VM (called once at the end)."""
-    try:
-        subprocess.run(
-            ["vagrant", "halt", "-f"],
-            cwd=project_dir,
-            timeout=CLEANUP_HALT_TIMEOUT_SECONDS,
-            capture_output=True,
-        )
-    except Exception as e:
-        logger.debug("vagrant halt failed (non-critical): %s", e)
+def worker_loop(
+    worker: WorkerInfo,
+    sample_queue: queue.Queue,
+    config: BatchConfig,
+    results: list[SampleResult],
+    results_lock: threading.Lock,
+    total: int,
+    progress: BatchProgress,
+) -> None:
+    """Per-worker thread: dequeue and process samples sequentially."""
+    consecutive_failures = 0
+
+    while not _shutdown.is_set():
+        try:
+            sample = sample_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        try:
+            result = process_sample(sample, worker, config)
+
+            if result.status == SampleStatus.SUCCESS:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            with results_lock:
+                results.append(result)
+
+            done, ok, fail = progress.record(result.status)
+
+            icon = {
+                SampleStatus.SUCCESS: "OK",
+                SampleStatus.TIMEOUT: "TIMEOUT",
+                SampleStatus.ERROR: "FAIL",
+            }.get(result.status, "?")
+
+            logger.info(
+                "[%d/%d] W%d %s -> %s (%.1fs, WtE=%s, dumps=%d) [ok=%d fail=%d]",
+                done, total, worker.worker_id, result.sample_name, icon,
+                result.duration_seconds,
+                result.wte_count if result.wte_count is not None else "?",
+                result.dump_file_count,
+                ok, fail,
+            )
+
+            # Circuit breaker: stop after too many consecutive failures
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.error(
+                    "[W%d] %d consecutive failures, stopping worker",
+                    worker.worker_id, consecutive_failures,
+                )
+                break
+
+        except Exception as e:
+            logger.error(
+                "[W%d] Unexpected error: %s", worker.worker_id, e, exc_info=True
+            )
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.error(
+                    "[W%d] Stopping after %d failures",
+                    worker.worker_id, consecutive_failures,
+                )
+                break
+
+        finally:
+            sample_queue.task_done()
 
 
-# -- Batch Orchestration --
+def run_batch(config: BatchConfig, workers: list[WorkerInfo]) -> list[SampleResult]:
+    """Run batch analysis with independent worker pool."""
+    # Clear shutdown flag from any previous run
+    _shutdown.clear()
 
-def run_batch(config: BatchConfig) -> list[SampleResult]:
-    """Run batch analysis across all samples with parallel workers."""
     samples = discover_samples(config.samples_dir)
     if not samples:
         logger.error("No PE files found in %s", config.samples_dir)
         return []
 
-    logger.info("Found %d samples in %s", len(samples), config.samples_dir)
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Found %d samples", len(samples))
 
-    # Filter already-processed samples
+    # Filter already processed
     if not config.force:
         pending = [s for s in samples if not is_already_processed(s, config.output_dir)]
-        skipped_count = len(samples) - len(pending)
-        if skipped_count > 0:
+        skipped = len(samples) - len(pending)
+        if skipped:
             logger.info(
                 "Skipping %d already-processed samples (use --force to re-run)",
-                skipped_count,
+                skipped,
             )
     else:
         pending = samples
 
     results: list[SampleResult] = []
+    results_lock = threading.Lock()
+    progress = BatchProgress()
 
+    # Add skipped results
     for s in samples:
         if s not in pending:
             results.append(SampleResult(
@@ -860,59 +861,67 @@ def run_batch(config: BatchConfig) -> list[SampleResult]:
 
     total = len(pending)
     if total == 0:
-        logger.info("Nothing to process.")
+        logger.info("Nothing to process")
         return results
 
-    # Reset progress counter
-    _progress_counter["done"] = 0
+    # Create sample queue
+    sample_q: queue.Queue = queue.Queue()
+    for s in pending:
+        sample_q.put(s)
 
-    num_workers = min(config.num_workers, total)
+    num_workers = min(len(workers), total)
+    active_workers = workers[:num_workers]
+
     logger.info(
-        "Processing %d samples with %d parallel worker(s)",
+        "Processing %d samples with %d independent workers (fully parallel)",
         total, num_workers,
     )
-    logger.info(
-        "Pipeline: provision is serialized, analysis runs in parallel"
-    )
 
-    if num_workers == 1:
-        # Sequential mode — simpler, no thread pool overhead
-        for sample in pending:
-            result = process_sample(sample, config, total)
-            results.append(result)
-    else:
-        # Parallel mode — provision serialized via lock, analysis in parallel
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=num_workers,
-            thread_name_prefix="worker",
-        ) as executor:
-            futures = {
-                executor.submit(process_sample, sample, config, total): sample
-                for sample in pending
-            }
-            for future in concurrent.futures.as_completed(futures):
-                sample = futures[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    logger.error("Unexpected error processing %s: %s", sample.name, e)
-                    result = SampleResult(
-                        sample_name=sample.stem,
-                        status=SampleStatus.ERROR,
-                        duration_seconds=0.0,
-                        error_message=f"Thread error: {e}",
-                    )
-                results.append(result)
+    # Launch worker threads
+    threads = []
+    for worker in active_workers:
+        t = threading.Thread(
+            target=worker_loop,
+            args=(worker, sample_q, config, results, results_lock, total, progress),
+            name=f"W{worker.worker_id}",
+            daemon=True,
+        )
+        threads.append(t)
+        t.start()
+
+    # Wait for completion
+    for t in threads:
+        t.join()
+
+    # Drain unprocessed samples (all workers hit circuit breaker or shutdown)
+    while True:
+        try:
+            sample = sample_q.get_nowait()
+            results.append(SampleResult(
+                sample_name=sample.stem,
+                status=SampleStatus.ERROR,
+                duration_seconds=0.0,
+                error_message="Worker pool exhausted before sample was processed",
+            ))
+        except queue.Empty:
+            break
+
+    unprocessed = sum(
+        1 for r in results
+        if r.error_message == "Worker pool exhausted before sample was processed"
+    )
+    if unprocessed > 0:
+        logger.error("%d samples unprocessed (all workers stopped)", unprocessed)
 
     return results
 
 
 # -- Reporting --
 
+
 def generate_report(results: list[SampleResult], output_dir: Path) -> None:
-    """Write summary report to console and files."""
+    """Write summary report to console and file."""
     if not results:
-        logger.info("No results to report.")
         return
 
     succeeded = [r for r in results if r.status == SampleStatus.SUCCESS]
@@ -929,21 +938,48 @@ def generate_report(results: list[SampleResult], output_dir: Path) -> None:
     logger.info("  Failed:    %d", len(failed))
     logger.info("  Timed out: %d", len(timed_out))
     logger.info("  Skipped:   %d", len(skipped))
-    logger.info("")
 
-    logger.info("%-40s %-10s %8s %6s %6s", "Sample", "Status", "Time(s)", "WtE", "Dumps")
-    logger.info("-" * 74)
-    for r in results:
-        if r.status == SampleStatus.SKIPPED:
-            continue
+    if succeeded:
+        avg = sum(r.duration_seconds for r in succeeded) / len(succeeded)
+        total_dumps = sum(r.dump_file_count for r in succeeded)
+        logger.info("  Avg time:  %.1fs (successful samples)", avg)
+        logger.info("  Total dumps: %d", total_dumps)
+
+    # Show details for active results (limit output for large batches)
+    active = [r for r in results if r.status != SampleStatus.SKIPPED]
+    show_limit = 200
+    if active:
+        logger.info("")
         logger.info(
-            "%-40s %-10s %8.1f %6s %6d",
-            r.sample_name[:40],
-            r.status.value,
-            r.duration_seconds,
-            str(r.wte_count) if r.wte_count is not None else "-",
-            r.dump_file_count,
+            "%-40s %-10s %5s %8s %6s %6s",
+            "Sample", "Status", "W#", "Time", "WtE", "Dumps",
         )
+        logger.info("-" * 80)
+        for r in active[:show_limit]:
+            logger.info(
+                "%-40s %-10s %5d %7.1fs %6s %6d",
+                r.sample_name[:40], r.status.value, r.worker_id,
+                r.duration_seconds,
+                str(r.wte_count) if r.wte_count is not None else "-",
+                r.dump_file_count,
+            )
+        if len(active) > show_limit:
+            logger.info("  ... and %d more (see batch_report.json)", len(active) - show_limit)
+
+    # Write JSON report (summary + failures only for large batches)
+    failures_list = [
+        {
+            "sample_name": r.sample_name,
+            "status": r.status.value,
+            "duration_seconds": round(r.duration_seconds, 1),
+            "worker_id": r.worker_id,
+            "error_message": r.error_message,
+            "wte_count": r.wte_count,
+            "dump_file_count": r.dump_file_count,
+        }
+        for r in results
+        if r.status in (SampleStatus.ERROR, SampleStatus.TIMEOUT)
+    ]
 
     report_data = {
         "timestamp": datetime.now().isoformat(),
@@ -954,126 +990,244 @@ def generate_report(results: list[SampleResult], output_dir: Path) -> None:
             "timed_out": len(timed_out),
             "skipped": len(skipped),
         },
-        "results": [
-            {
-                "sample_name": r.sample_name,
-                "status": r.status.value,
-                "duration_seconds": round(r.duration_seconds, 1),
-                "error_message": r.error_message,
-                "wte_count": r.wte_count,
-                "dump_file_count": r.dump_file_count,
-            }
-            for r in results
-        ],
+        "failures": failures_list,
     }
 
+    output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "batch_report.json"
     report_path.write_text(json.dumps(report_data, indent=2) + "\n")
-    logger.info("Report written to %s", report_path)
+    logger.info("Report: %s", report_path)
 
 
-# -- CLI --
+# -- Utility --
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Batch PE unpacking analysis using kAFL",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s /path/to/packed_samples
-  %(prog)s /path/to/packed_samples -n 2 -o ./results -t 600
-  %(prog)s /path/to/packed_samples -n 4 --force
-        """,
-    )
-    parser.add_argument("samples_dir", type=Path,
-                        help="Directory containing packed PE samples")
-    parser.add_argument("-n", "--workers", type=int, default=2,
-                        help="Number of parallel VMs/workers (default: 2)")
-    parser.add_argument("-o", "--output-dir", type=Path, default=Path("./batch_results"),
-                        help="Output directory for results (default: ./batch_results)")
-    parser.add_argument("-w", "--workdir", type=Path, default=Path("/dev/shm/kafl_batch"),
-                        help="Base kAFL working directory (default: /dev/shm/kafl_batch)")
-    parser.add_argument("--image-dir", type=Path, default=None,
-                        help="Directory for standalone disk images (default: next to base image)")
-    parser.add_argument("-t", "--timeout", type=int, default=600,
-                        help="Per-sample timeout in seconds (default: 600)")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-process already-completed samples")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Enable debug logging")
 
-    args = parser.parse_args()
+def _run_cmd(
+    cmd: list[str],
+    cwd: Path,
+    timeout: int,
+    label: str,
+    env: Optional[dict] = None,
+) -> subprocess.CompletedProcess:
+    """Run a subprocess with timeout and logging."""
+    logger.debug("Running: %s (cwd=%s)", " ".join(cmd), cwd)
+    try:
+        result = subprocess.run(
+            cmd, cwd=cwd, timeout=timeout,
+            capture_output=True, text=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            logger.error(
+                "%s failed (rc=%d):\nstdout: %s\nstderr: %s",
+                label, result.returncode,
+                result.stdout[-500:] if result.stdout else "",
+                result.stderr[-500:] if result.stderr else "",
+            )
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, result.stdout, result.stderr,
+            )
+        return result
+    except subprocess.TimeoutExpired:
+        logger.error("%s timed out after %ds", label, timeout)
+        raise
 
-    # Setup logging
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    log_format = "%(asctime)s [%(levelname)-7s] %(message)s"
-    logging.basicConfig(level=log_level, format=log_format, datefmt="%H:%M:%S")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(args.output_dir / "batch_analyze.log")
-    file_handler.setFormatter(logging.Formatter(log_format, datefmt="%Y-%m-%d %H:%M:%S"))
-    file_handler.setLevel(logging.DEBUG)
-    logger.addHandler(file_handler)
+def resolve_qemu_memory(project_dir: Path) -> int:
+    """Read qemu_memory from kafl.yaml (default: 4096)."""
+    kafl_yaml = project_dir / "kafl.yaml"
+    if not kafl_yaml.exists():
+        return 4096
 
+    for line in kafl_yaml.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("qemu_memory:"):
+            try:
+                return int(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    return 4096
+
+
+# -- CLI Subcommands --
+
+
+def cmd_setup(args: argparse.Namespace) -> None:
+    project_dir = Path(__file__).resolve().parent
+    workers = setup_workers(project_dir, args.workers)
+    logger.info("")
+    logger.info("Setup complete: %d workers ready", len(workers))
+    for w in workers:
+        logger.info(
+            "  W%d: %s (image: %s)", w.worker_id, w.vm_name, w.disk_image
+        )
+
+
+def cmd_run(args: argparse.Namespace) -> None:
     project_dir = Path(__file__).resolve().parent
 
-    # Resolve base disk image and qemu_memory from kafl.yaml
-    try:
-        kafl_config = resolve_kafl_yaml(project_dir)
-    except (FileNotFoundError, ValueError) as e:
-        logger.error("Failed to resolve kafl.yaml: %s", e)
+    workers = load_workers(project_dir)
+    if not workers:
+        logger.error("No workers found. Run 'setup' first.")
         sys.exit(1)
 
-    base_image = kafl_config.base_image
-    qemu_memory = kafl_config.qemu_memory
-
-    # Default image_dir: same directory as the base image
-    image_dir = args.image_dir
-    if image_dir is None:
-        image_dir = base_image.parent / "batch_images"
-    image_dir = image_dir.resolve()
-    image_dir.mkdir(parents=True, exist_ok=True)
+    qemu_memory = resolve_qemu_memory(project_dir)
 
     config = BatchConfig(
         samples_dir=args.samples_dir.resolve(),
         output_dir=args.output_dir.resolve(),
         workdir_base=args.workdir.resolve(),
-        image_dir=image_dir,
         timeout_seconds=args.timeout,
         project_dir=project_dir,
         force=args.force,
-        num_workers=args.workers,
-        base_image=base_image,
         qemu_memory=qemu_memory,
+        kafl_extra_args=tuple(args.kafl_args) if args.kafl_args else (),
     )
 
-    logger.info("Batch Analyzer starting")
-    logger.info("  Samples:    %s", config.samples_dir)
-    logger.info("  Output:     %s", config.output_dir)
-    logger.info("  Workdir:    %s", config.workdir_base)
-    logger.info("  Image dir:  %s", config.image_dir)
-    logger.info("  Workers:    %d", config.num_workers)
-    logger.info("  Timeout:    %ds per sample", config.timeout_seconds)
-    logger.info("  Base image: %s", config.base_image)
-    logger.info("  QEMU RAM:   %d MB", config.qemu_memory)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Preflight: ensure clean environment
-    try:
-        preflight_check(config.project_dir)
-    except RuntimeError as e:
-        logger.error("Preflight check failed: %s", e)
-        logger.error("Please manually run: vagrant destroy -f && vagrant up --no-provision && vagrant snapshot save 'ready_provision'")
-        sys.exit(1)
+    # File logging
+    file_handler = logging.FileHandler(config.output_dir / "batch_analyze.log")
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)-7s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    file_handler.setLevel(logging.DEBUG)
+    logger.addHandler(file_handler)
+
+    logger.info("Batch run starting")
+    logger.info("  Samples:  %s", config.samples_dir)
+    logger.info("  Output:   %s", config.output_dir)
+    logger.info("  Workdir:  %s", config.workdir_base)
+    logger.info("  Workers:  %d", len(workers))
+    logger.info("  Timeout:  %ds", config.timeout_seconds)
+    logger.info("  Memory:   %d MB", config.qemu_memory)
+
+    # Install signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     try:
-        results = run_batch(config)
+        results = run_batch(config, workers)
     finally:
-        cleanup_all(config.project_dir)
+        # Halt all workers on exit
+        for w in workers:
+            try:
+                _halt_worker(w)
+            except Exception:
+                pass
 
     generate_report(results, config.output_dir)
 
-    failed = sum(1 for r in results if r.status in (SampleStatus.ERROR, SampleStatus.TIMEOUT))
+    failed = sum(
+        1 for r in results
+        if r.status in (SampleStatus.ERROR, SampleStatus.TIMEOUT)
+    )
     sys.exit(1 if failed > 0 else 0)
+
+
+def cmd_teardown(_args: argparse.Namespace) -> None:
+    project_dir = Path(__file__).resolve().parent
+    teardown_workers(project_dir)
+
+
+def cmd_status(_args: argparse.Namespace) -> None:
+    project_dir = Path(__file__).resolve().parent
+    try:
+        workers = load_workers(project_dir)
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    logger.info("Workers: %d", len(workers))
+    for w in workers:
+        try:
+            result = subprocess.run(
+                ["vagrant", "status", "--machine-readable"],
+                cwd=w.worker_dir, capture_output=True, text=True, timeout=30,
+            )
+            state = "unknown"
+            for line in result.stdout.splitlines():
+                parts = line.split(",")
+                if len(parts) >= 4 and parts[2] == "state":
+                    state = parts[3]
+
+            image_ok = w.disk_image.exists()
+            image_gb = w.disk_image.stat().st_size / (1024**3) if image_ok else 0
+
+            logger.info(
+                "  W%d: %-12s image=%s (%.1f GB)",
+                w.worker_id, state,
+                "OK" if image_ok else "MISSING",
+                image_gb,
+            )
+        except Exception as e:
+            logger.info("  W%d: ERROR (%s)", w.worker_id, e)
+
+
+# -- Entry Point --
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Batch PE unpacking analysis with independent worker VMs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  %(prog)s setup -n 4              # Create 4 worker VMs (one-time)
+  %(prog)s run ./samples -t 600    # Analyze all samples
+  %(prog)s status                  # Check worker health
+  %(prog)s teardown                # Destroy all workers
+""",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable debug logging")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # setup
+    p_setup = sub.add_parser("setup", help="Create independent worker VMs")
+    p_setup.add_argument(
+        "-n", "--workers", type=int, default=4,
+        help="Number of workers to create (default: 4)",
+    )
+    p_setup.set_defaults(func=cmd_setup)
+
+    # run
+    p_run = sub.add_parser("run", help="Run batch analysis")
+    p_run.add_argument("samples_dir", type=Path,
+                       help="Directory containing packed PE samples")
+    p_run.add_argument("-o", "--output-dir", type=Path,
+                       default=Path("./batch_results"),
+                       help="Output directory (default: ./batch_results)")
+    p_run.add_argument("-w", "--workdir", type=Path,
+                       default=Path("/tmp/kafl_batch"),
+                       help="kAFL working directory base (default: /tmp/kafl_batch)")
+    p_run.add_argument("-t", "--timeout", type=int, default=600,
+                       help="Per-sample timeout in seconds (default: 600)")
+    p_run.add_argument("--force", action="store_true",
+                       help="Re-process already-completed samples")
+    p_run.add_argument("--kafl-args", nargs="*",
+                       help="Extra arguments for kafl fuzz")
+    p_run.set_defaults(func=cmd_run)
+
+    # teardown
+    p_teardown = sub.add_parser("teardown", help="Destroy all worker VMs")
+    p_teardown.set_defaults(func=cmd_teardown)
+
+    # status
+    p_status = sub.add_parser("status", help="Show worker VM status")
+    p_status.set_defaults(func=cmd_status)
+
+    args = parser.parse_args()
+
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)-7s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    args.func(args)
 
 
 if __name__ == "__main__":

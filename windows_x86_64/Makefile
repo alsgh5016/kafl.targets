@@ -33,3 +33,15 @@ provision_driver: compile ansible
 	vagrant snapshot restore 'ready_provision'
 	TARGET_HARNESS='driver' vagrant provision
 	vagrant halt
+
+# -- Batch analysis with independent worker VMs --
+NUM_WORKERS ?= 4
+
+setup-workers: compile ansible
+	python3 batch_analyze.py setup -n $(NUM_WORKERS)
+
+teardown-workers:
+	python3 batch_analyze.py teardown
+
+batch-status:
+	python3 batch_analyze.py status

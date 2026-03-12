@@ -14,7 +14,7 @@
 
     - name: Upload binaries
       win_copy:
-        src: bin
+        src: "{{ bin_src | default('bin') }}"
         dest: "{{ dest_path }}"
 
     - name: Setup userspace harness target
