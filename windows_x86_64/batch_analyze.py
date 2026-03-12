@@ -479,10 +479,8 @@ def run_kafl(
     # The default kafl.yaml uses fixed paths (-monitor unix:/tmp/monitor.sock,
     # -vnc :0) which conflict when multiple QEMU instances run simultaneously.
     monitor_sock = workdir / "monitor.sock"
-    cmd.extend([
-        "--qemu-extra",
-        f"-monitor unix:{monitor_sock},server,nowait -vnc none",
-    ])
+    qemu_extra = f"-monitor unix:{monitor_sock},server,nowait -vnc none"
+    cmd.append(f"--qemu-extra={qemu_extra}")
     cmd.extend(extra_args)
 
     logger.info("Running: %s", " ".join(cmd))
