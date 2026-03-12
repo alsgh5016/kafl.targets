@@ -49,8 +49,6 @@ class SampleStatus(enum.Enum):
     SKIPPED = "skipped"
 
 
-QEMU_IMG_CONVERT_TIMEOUT_SECONDS = 600
-
 
 @dataclass(frozen=True)
 class BatchConfig:
@@ -155,51 +153,19 @@ def resolve_kafl_yaml(project_dir: Path) -> KaflYamlConfig:
     return KaflYamlConfig(base_image=base_image, qemu_memory=qemu_memory)
 
 
-def _detect_image_format(image_path: Path) -> str:
-    """Detect the actual format of a disk image using qemu-img info."""
-    try:
-        result = subprocess.run(
-            ["qemu-img", "info", "--output=json", str(image_path)],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            info = json.loads(result.stdout)
-            fmt = info.get("format", "raw")
-            logger.debug("Detected image format: %s -> %s", image_path.name, fmt)
-            return fmt
-    except Exception as e:
-        logger.warning("Failed to detect image format: %s", e)
-    return "raw"
-
 
 def create_standalone_image(base_image: Path, output_path: Path) -> Path:
-    """Create a standalone copy of the base image.
+    """Create a byte-for-byte copy of the base image.
 
-    Uses the same format as the base image to avoid conversion issues.
-    The copy has NO backing file reference, so vagrant can freely modify
-    the base for the next sample while QEMU uses this copy for analysis.
+    Uses cp instead of qemu-img convert to preserve the exact qcow2
+    structure, metadata, and features. This avoids QEMU-Nyx compatibility
+    issues that arise from qemu-img convert producing a restructured image.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    base_format = _detect_image_format(base_image)
-    # Use the same output format to avoid conversion artifacts
-    out_format = base_format
-
     start = time.time()
-    cmd = [
-        "qemu-img", "convert",
-        "-f", base_format,
-        "-O", out_format,
-        str(base_image),
-        str(output_path),
-    ]
-    logger.info("Converting: %s (%s) -> %s (%s)", base_image.name, base_format, output_path.name, out_format)
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        timeout=QEMU_IMG_CONVERT_TIMEOUT_SECONDS,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"qemu-img convert failed: {result.stderr}")
+    logger.info("Copying: %s -> %s", base_image.name, output_path.name)
+    shutil.copy2(str(base_image), str(output_path))
 
     elapsed = time.time() - start
     size_mb = output_path.stat().st_size / (1024 * 1024)
@@ -511,6 +477,7 @@ def run_kafl(
     cmd.extend(extra_args)
 
     logger.info("Running: %s", " ".join(cmd))
+    start_time = time.time()
 
     proc = subprocess.Popen(
         cmd, cwd=project_dir,
@@ -530,15 +497,21 @@ def run_kafl(
             stdout, stderr = proc.communicate()
         raise subprocess.TimeoutExpired(cmd, timeout, stdout, stderr)
 
-    logger.debug("kAFL exited with rc=%d", proc.returncode)
-    if proc.returncode != 0:
-        logger.error("kAFL failed (rc=%d)", proc.returncode)
+    elapsed = time.time() - start_time
+    logger.debug("kAFL exited with rc=%d after %.1fs", proc.returncode, elapsed)
+
+    # Log output on failure OR suspiciously fast exit (under 30s)
+    should_log = proc.returncode != 0 or elapsed < 30
+    if should_log:
+        level = "ERROR" if proc.returncode != 0 else "WARNING"
+        log_fn = logger.error if proc.returncode != 0 else logger.warning
+        log_fn("kAFL %s (rc=%d, %.1fs)", "failed" if proc.returncode != 0 else "exited too quickly", proc.returncode, elapsed)
         if stdout and stdout.strip():
-            for line in stdout.strip().splitlines()[-20:]:
-                logger.error("  stdout: %s", line)
+            for line in stdout.strip().splitlines()[-30:]:
+                log_fn("  stdout: %s", line)
         if stderr and stderr.strip():
-            for line in stderr.strip().splitlines()[-20:]:
-                logger.error("  stderr: %s", line)
+            for line in stderr.strip().splitlines()[-30:]:
+                log_fn("  stderr: %s", line)
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
