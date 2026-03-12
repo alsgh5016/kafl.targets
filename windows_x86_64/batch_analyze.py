@@ -390,12 +390,31 @@ def provision_vm(sample_path: Path, project_dir: Path) -> None:
     # Ensure no stale vagrant lock from a previous failed cycle
     _cleanup_vagrant_lock(project_dir)
 
-    _run_cmd(
-        ["make", "provision_unpack"],
-        cwd=project_dir,
-        timeout=PROVISION_TIMEOUT_SECONDS,
-        label="make provision_unpack",
-    )
+    # Provision with retry: vagrant networking can be flaky when another
+    # QEMU instance is running (parallel analysis). Retry up to 3 times
+    # with increasing delay.
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            _run_cmd(
+                ["make", "provision_unpack"],
+                cwd=project_dir,
+                timeout=PROVISION_TIMEOUT_SECONDS,
+                label="make provision_unpack",
+            )
+            break
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            if attempt == max_retries:
+                raise
+            delay = attempt * 15
+            logger.warning(
+                "Provision attempt %d/%d failed, retrying in %ds...",
+                attempt, max_retries, delay,
+            )
+            # Force halt and cleanup before retry
+            _halt_vagrant(project_dir)
+            _cleanup_vagrant_lock(project_dir)
+            time.sleep(delay)
 
     # Clean shutdown preserves qcow2 disk state for QEMU-Nyx.
     # Fall back to forced halt if guest communication fails (e.g. WinRM down).
