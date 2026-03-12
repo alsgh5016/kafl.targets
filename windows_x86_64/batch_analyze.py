@@ -63,6 +63,7 @@ class BatchConfig:
     force: bool
     num_workers: int
     base_image: Path
+    qemu_memory: int = 4096
     kafl_extra_args: tuple[str, ...] = ()
 
 
@@ -115,27 +116,43 @@ def is_already_processed(sample_path: Path, output_dir: Path) -> bool:
 
 # -- Disk Image Management --
 
-def resolve_base_image(project_dir: Path) -> Path:
-    """Read kafl.yaml to find the base disk image path."""
+@dataclass(frozen=True)
+class KaflYamlConfig:
+    base_image: Path
+    qemu_memory: int
+
+
+def resolve_kafl_yaml(project_dir: Path) -> KaflYamlConfig:
+    """Read kafl.yaml to find the base disk image path and qemu_memory."""
     kafl_yaml = project_dir / "kafl.yaml"
     if not kafl_yaml.exists():
         raise FileNotFoundError(f"kafl.yaml not found in {project_dir}")
 
     content = kafl_yaml.read_text()
-    # Parse qemu_image line: qemu_image: '@format {env[HOME]}/.local/share/...'
+    base_image: Optional[Path] = None
+    qemu_memory = 256  # kafl default
+
     for line in content.splitlines():
-        if line.strip().startswith("qemu_image:"):
-            value = line.split(":", 1)[1].strip().strip("'\"")
-            # Resolve @format {env[HOME]} pattern
+        stripped = line.strip()
+        if stripped.startswith("qemu_image:"):
+            value = stripped.split(":", 1)[1].strip().strip("'\"")
             if "@format" in value:
                 value = value.replace("@format ", "")
                 value = value.replace("{env[HOME]}", os.environ["HOME"])
             path = Path(value)
-            if path.exists():
-                return path.resolve()
-            raise FileNotFoundError(f"Base image not found: {path}")
+            if not path.exists():
+                raise FileNotFoundError(f"Base image not found: {path}")
+            base_image = path.resolve()
+        elif stripped.startswith("qemu_memory:"):
+            try:
+                qemu_memory = int(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                pass
 
-    raise ValueError("qemu_image not found in kafl.yaml")
+    if base_image is None:
+        raise ValueError("qemu_image not found in kafl.yaml")
+
+    return KaflYamlConfig(base_image=base_image, qemu_memory=qemu_memory)
 
 
 def create_standalone_image(base_image: Path, output_path: Path) -> Path:
@@ -176,8 +193,16 @@ def create_standalone_image(base_image: Path, output_path: Path) -> Path:
     return output_path
 
 
-def remove_worker_image(image_path: Path) -> None:
-    """Remove a standalone qcow2 worker image."""
+def remove_worker_image(image_path: Path, *, keep_on_failure: bool = False) -> None:
+    """Remove a standalone qcow2 worker image.
+
+    Args:
+        image_path: Path to the qcow2 image file.
+        keep_on_failure: If True, skip deletion (keep image for debugging).
+    """
+    if keep_on_failure:
+        logger.info("Keeping worker image for debugging: %s", image_path)
+        return
     try:
         if image_path.exists():
             size_mb = image_path.stat().st_size / (1024 * 1024)
@@ -404,6 +429,7 @@ def run_kafl(
     project_dir: Path,
     timeout: int,
     image_path: Optional[Path] = None,
+    qemu_memory: Optional[int] = None,
     extra_args: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """Run kafl fuzz and wait for completion or timeout."""
@@ -416,6 +442,8 @@ def run_kafl(
     ]
     if image_path is not None:
         cmd.extend(["--image", str(image_path)])
+    if qemu_memory is not None:
+        cmd.extend(["--memory", str(qemu_memory)])
     cmd.extend(extra_args)
 
     logger.info("Running: %s", " ".join(cmd))
@@ -572,12 +600,19 @@ def process_sample(
         # Phase 3: Run kAFL analysis (parallel)
         # The standalone qcow2 has no backing file reference, so it
         # doesn't lock the base image — vagrant can provision the next sample.
-        logger.info("[ANALYZE] %s: starting kAFL...", sample_name)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Standalone image missing before kafl: {image_path}")
+        logger.info(
+            "[ANALYZE] %s: starting kAFL (image: %s, %.0f MB)...",
+            sample_name, image_path.name,
+            image_path.stat().st_size / (1024 * 1024),
+        )
         run_kafl(
             worker_workdir,
             config.project_dir,
             config.timeout_seconds,
             image_path=image_path,
+            qemu_memory=config.qemu_memory,
             extra_args=config.kafl_extra_args,
         )
 
@@ -631,7 +666,8 @@ def process_sample(
             )
         if worker_workdir.exists():
             collect_results(worker_workdir, config.output_dir, sample_name, result)
-        remove_worker_image(image_path)
+        is_failure = result is not None and result.status != SampleStatus.SUCCESS
+        remove_worker_image(image_path, keep_on_failure=is_failure)
         _cleanup_kafl(worker_workdir)
 
         with _progress_lock:
@@ -883,12 +919,15 @@ Examples:
 
     project_dir = Path(__file__).resolve().parent
 
-    # Resolve base disk image from kafl.yaml
+    # Resolve base disk image and qemu_memory from kafl.yaml
     try:
-        base_image = resolve_base_image(project_dir)
+        kafl_config = resolve_kafl_yaml(project_dir)
     except (FileNotFoundError, ValueError) as e:
-        logger.error("Failed to resolve base image: %s", e)
+        logger.error("Failed to resolve kafl.yaml: %s", e)
         sys.exit(1)
+
+    base_image = kafl_config.base_image
+    qemu_memory = kafl_config.qemu_memory
 
     # Default image_dir: same directory as the base image
     image_dir = args.image_dir
@@ -907,6 +946,7 @@ Examples:
         force=args.force,
         num_workers=args.workers,
         base_image=base_image,
+        qemu_memory=qemu_memory,
     )
 
     logger.info("Batch Analyzer starting")
@@ -917,6 +957,7 @@ Examples:
     logger.info("  Workers:    %d", config.num_workers)
     logger.info("  Timeout:    %ds per sample", config.timeout_seconds)
     logger.info("  Base image: %s", config.base_image)
+    logger.info("  QEMU RAM:   %d MB", config.qemu_memory)
 
     # Preflight: ensure clean environment
     try:
