@@ -722,6 +722,13 @@ def process_sample(
         if workdir.exists():
             collect_results(workdir, config.output_dir, sample_name, result)
         _cleanup_kafl(workdir)
+        # Remove workdir after collecting results to avoid duplicate storage
+        if workdir.exists():
+            try:
+                shutil.rmtree(workdir)
+                logger.debug("Removed workdir: %s", workdir)
+            except OSError as exc:
+                logger.debug("Failed to remove workdir %s: %s", workdir, exc)
 
     return result
 
