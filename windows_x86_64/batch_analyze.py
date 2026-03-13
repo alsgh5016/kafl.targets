@@ -486,6 +486,7 @@ def run_kafl(
         "--purge",
         "-w", str(workdir),
         "--log-hprintf",
+        "--trace",
         "-p", "1",
         "--image", str(worker.disk_image),
         "--memory", str(qemu_memory),
