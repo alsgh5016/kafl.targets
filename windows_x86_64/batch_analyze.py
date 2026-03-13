@@ -208,10 +208,21 @@ def setup_workers(project_dir: Path, num_workers: int) -> list[WorkerInfo]:
         worker_dir = workers_base / f"worker{i}"
         vm_name = f"kafl-worker-{i}"
 
-        _create_worker_dir(worker_dir, project_dir)
-        _init_worker_vm(worker_dir)
+        # If worker already fully set up (has snapshot), reuse it
+        if _is_worker_ready(worker_dir, vm_name):
+            logger.info("Worker %d already set up, reusing", i)
+            disk_image = _discover_disk_image(worker_dir, vm_name)
+        else:
+            # Clean up any partial state from previous attempts
+            if worker_dir.exists():
+                logger.info("Cleaning up partial worker %d...", i)
+                _destroy_worker_vm(worker_dir)
+                shutil.rmtree(worker_dir)
 
-        disk_image = _discover_disk_image(worker_dir, vm_name)
+            _create_worker_dir(worker_dir, project_dir)
+            _init_worker_vm(worker_dir)
+            disk_image = _discover_disk_image(worker_dir, vm_name)
+
         logger.info("Worker %d ready: %s (image: %s)", i, vm_name, disk_image)
 
         workers.append(WorkerInfo(
@@ -225,12 +236,37 @@ def setup_workers(project_dir: Path, num_workers: int) -> list[WorkerInfo]:
     return workers
 
 
+def _is_worker_ready(worker_dir: Path, vm_name: str) -> bool:
+    """Check if a worker VM is already fully set up with a snapshot."""
+    if not worker_dir.exists():
+        return False
+    if not (worker_dir / "Vagrantfile").exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["vagrant", "snapshot", "list"],
+            cwd=worker_dir, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return False
+        return "ready_provision" in result.stdout
+    except Exception:
+        return False
+
+
+def _destroy_worker_vm(worker_dir: Path) -> None:
+    """Destroy a worker VM (best-effort, for cleanup)."""
+    try:
+        subprocess.run(
+            ["vagrant", "destroy", "-f"],
+            cwd=worker_dir, capture_output=True, text=True, timeout=120,
+        )
+    except Exception as e:
+        logger.debug("vagrant destroy failed (non-critical): %s", e)
+
+
 def _create_worker_dir(worker_dir: Path, project_dir: Path) -> None:
     """Create worker directory with Vagrantfile, symlinks, and bin/ copy."""
-    if worker_dir.exists():
-        logger.warning("Worker dir already exists: %s", worker_dir)
-        return
-
     worker_dir.mkdir(parents=True)
 
     # Write Vagrantfile
