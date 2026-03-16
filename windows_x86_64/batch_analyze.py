@@ -255,7 +255,15 @@ def _is_worker_ready(worker_dir: Path, vm_name: str) -> bool:
 
 
 def _destroy_worker_vm(worker_dir: Path) -> None:
-    """Destroy a worker VM (best-effort, for cleanup)."""
+    """Destroy a worker VM (best-effort, for cleanup).
+
+    Falls back to virsh undefine if vagrant destroy fails to remove
+    the libvirt domain.
+    """
+    worker_id = worker_dir.name.replace("worker", "")
+    vm_name = f"kafl-worker-{worker_id}"
+    domain_name = f"{worker_dir.name}_{vm_name}"
+
     try:
         subprocess.run(
             ["vagrant", "destroy", "-f"],
@@ -263,6 +271,30 @@ def _destroy_worker_vm(worker_dir: Path) -> None:
         )
     except Exception as e:
         logger.debug("vagrant destroy failed (non-critical): %s", e)
+
+    # Fallback: remove lingering libvirt domain via virsh
+    for conn in ["qemu:///session", "qemu:///system"]:
+        try:
+            result = subprocess.run(
+                ["virsh", "-c", conn, "domstate", domain_name],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                continue
+            state = result.stdout.strip()
+            if state == "running":
+                subprocess.run(
+                    ["virsh", "-c", conn, "destroy", domain_name],
+                    capture_output=True, text=True, timeout=30,
+                )
+            subprocess.run(
+                ["virsh", "-c", conn, "undefine", domain_name,
+                 "--remove-all-storage", "--snapshots-metadata"],
+                capture_output=True, text=True, timeout=30,
+            )
+            logger.info("Removed lingering domain %s via %s", domain_name, conn)
+        except Exception as e:
+            logger.debug("virsh cleanup failed for %s (%s): %s", domain_name, conn, e)
 
 
 def _create_worker_dir(worker_dir: Path, project_dir: Path) -> None:
