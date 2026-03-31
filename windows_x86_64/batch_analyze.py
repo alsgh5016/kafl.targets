@@ -836,7 +836,34 @@ def process_sample(
             except OSError as exc:
                 logger.debug("Failed to remove workdir %s: %s", workdir, exc)
 
+        # On failure: restore snapshot to reset disk to clean state
+        # so the next sample doesn't inherit corrupted VM state
+        if result.status != SampleStatus.SUCCESS:
+            _recover_worker(worker)
+
     return result
+
+
+def _recover_worker(worker: WorkerInfo) -> bool:
+    """Restore worker VM to clean snapshot state after a failure.
+
+    Returns True if recovery succeeded.
+    """
+    logger.info("[W%d] Recovering worker (snapshot restore)...", worker.worker_id)
+    _cleanup_kafl(Path("/nonexistent"), worker)
+    _force_vm_off(worker)
+    try:
+        _run_cmd(
+            ["vagrant", "snapshot", "restore", "ready_provision"],
+            cwd=worker.worker_dir, timeout=120,
+            label=f"W{worker.worker_id} recovery restore",
+        )
+        _halt_worker(worker)
+        logger.info("[W%d] Worker recovered", worker.worker_id)
+        return True
+    except Exception as exc:
+        logger.error("[W%d] Worker recovery failed: %s", worker.worker_id, exc)
+        return False
 
 
 # -- Worker Loop & Batch Orchestration --
@@ -876,6 +903,7 @@ def worker_loop(
 ) -> None:
     """Per-worker thread: dequeue and process samples sequentially."""
     consecutive_failures = 0
+    recovery_attempted = False
 
     while not _shutdown.is_set():
         try:
@@ -888,6 +916,7 @@ def worker_loop(
 
             if result.status == SampleStatus.SUCCESS:
                 consecutive_failures = 0
+                recovery_attempted = False
             else:
                 consecutive_failures += 1
 
@@ -911,11 +940,22 @@ def worker_loop(
                 ok, fail,
             )
 
-            # Circuit breaker: stop after too many consecutive failures
+            # Circuit breaker: on consecutive failures, attempt recovery once
+            # before giving up
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                if not recovery_attempted:
+                    logger.warning(
+                        "[W%d] %d consecutive failures, attempting worker recovery...",
+                        worker.worker_id, consecutive_failures,
+                    )
+                    if _recover_worker(worker):
+                        consecutive_failures = 0
+                        recovery_attempted = True
+                        continue
                 logger.error(
-                    "[W%d] %d consecutive failures, stopping worker",
+                    "[W%d] %d consecutive failures (recovery %s), stopping worker",
                     worker.worker_id, consecutive_failures,
+                    "already tried" if recovery_attempted else "failed",
                 )
                 break
 
@@ -925,6 +965,15 @@ def worker_loop(
             )
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                if not recovery_attempted:
+                    logger.warning(
+                        "[W%d] Attempting worker recovery...",
+                        worker.worker_id,
+                    )
+                    if _recover_worker(worker):
+                        consecutive_failures = 0
+                        recovery_attempted = True
+                        continue
                 logger.error(
                     "[W%d] Stopping after %d failures",
                     worker.worker_id, consecutive_failures,
