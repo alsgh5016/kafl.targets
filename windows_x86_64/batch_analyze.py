@@ -480,7 +480,7 @@ def provision_sample(worker: WorkerInfo, sample_path: Path) -> None:
     )
 
     # Restore snapshot (boots VM to clean state)
-    max_retries = 2
+    max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
             _run_cmd(
@@ -493,10 +493,13 @@ def provision_sample(worker: WorkerInfo, sample_path: Path) -> None:
             if attempt == max_retries:
                 raise
             logger.warning(
-                "[W%d] Snapshot restore failed, retrying...", worker.worker_id
+                "[W%d] Snapshot restore failed (attempt %d/%d), recovering...",
+                worker.worker_id, attempt, max_retries,
             )
-            _halt_worker(worker)
-            time.sleep(5)
+            # Aggressive cleanup: kill stray QEMU, force VM off, then retry
+            _cleanup_kafl(Path("/nonexistent"), worker)
+            _force_vm_off(worker)
+            time.sleep(3)
 
     # Provision (ansible uploads bin/ and creates startup shortcut)
     env = {**os.environ, "TARGET_HARNESS": "unpack"}
@@ -533,6 +536,27 @@ def _halt_worker(worker: WorkerInfo) -> None:
         )
     except Exception as e:
         logger.warning("[W%d] Forced halt failed: %s", worker.worker_id, e)
+
+
+def _force_vm_off(worker: WorkerInfo) -> None:
+    """Force VM off via virsh destroy (best-effort, for stuck VMs)."""
+    domain = f"{worker.worker_dir.name}_{worker.vm_name}"
+    for conn in ["qemu:///session", "qemu:///system"]:
+        try:
+            subprocess.run(
+                ["virsh", "-c", conn, "destroy", domain],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            pass
+    # Also try vagrant halt -f as last resort
+    try:
+        subprocess.run(
+            ["vagrant", "halt", "-f"],
+            cwd=worker.worker_dir, capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        pass
 
 
 # -- kAFL Execution --
@@ -699,13 +723,23 @@ def _safe_validate(workdir: Path) -> tuple[bool, int, Optional[int]]:
     return False, 0, None
 
 
-def _cleanup_kafl(workdir: Path) -> None:
-    """Kill stray QEMU processes scoped to a workdir."""
-    try:
-        pattern = f"qemu-system-x86_64.*{re.escape(str(workdir))}"
-        subprocess.run(["pkill", "-f", pattern], timeout=10, capture_output=True)
-    except Exception as exc:
-        logger.debug("pkill cleanup failed (non-critical): %s", exc)
+def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
+    """Kill stray QEMU processes scoped to a workdir or worker disk image."""
+    patterns = [f"qemu-system-x86_64.*{re.escape(str(workdir))}"]
+    if worker is not None:
+        patterns.append(
+            f"qemu-system-x86_64.*{re.escape(str(worker.disk_image))}"
+        )
+    for pattern in patterns:
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                timeout=10, capture_output=True,
+            )
+        except Exception as exc:
+            logger.debug("pkill cleanup failed (non-critical): %s", exc)
+    # Brief pause to let OS reclaim resources
+    time.sleep(1)
 
 
 # -- Single Sample Processing --
@@ -726,6 +760,9 @@ def process_sample(
     result: Optional[SampleResult] = None
 
     try:
+        # Phase 0: Kill any stray QEMU from previous run on this worker
+        _cleanup_kafl(workdir, worker)
+
         # Phase 1: Provision worker VM with this sample
         logger.info("[W%d] Provisioning: %s", worker.worker_id, sample_name)
         provision_sample(worker, sample_path)
@@ -790,7 +827,7 @@ def process_sample(
             )
         if workdir.exists():
             collect_results(workdir, config.output_dir, sample_name, result)
-        _cleanup_kafl(workdir)
+        _cleanup_kafl(workdir, worker)
         # Remove workdir after collecting results to avoid duplicate storage
         if workdir.exists():
             try:
