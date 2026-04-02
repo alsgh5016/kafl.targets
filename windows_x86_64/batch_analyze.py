@@ -447,24 +447,18 @@ def teardown_workers(project_dir: Path) -> None:
     except (FileNotFoundError, json.JSONDecodeError):
         workers = []
 
-    destroy_failures = []
     for w in workers:
         logger.info("Destroying worker %d (%s)...", w.worker_id, w.vm_name)
-        try:
-            subprocess.run(
-                ["vagrant", "destroy", "-f"],
-                cwd=w.worker_dir, capture_output=True, text=True, timeout=120,
-            )
-        except Exception as e:
-            logger.warning("Failed to destroy worker %d: %s", w.worker_id, e)
-            destroy_failures.append(w)
+        _destroy_worker_vm(w.worker_dir)
 
-    if destroy_failures:
-        logger.warning(
-            "Some VMs may be orphaned in libvirt. "
-            "Run 'virsh -c qemu:///session list --all' to check, "
-            "and 'virsh -c qemu:///session undefine <name>' to clean up."
+    # Prune stale vagrant global-status entries
+    try:
+        subprocess.run(
+            ["vagrant", "global-status", "--prune"],
+            capture_output=True, text=True, timeout=30,
         )
+    except Exception:
+        pass
 
     shutil.rmtree(workers_base)
     logger.info("All workers removed")
