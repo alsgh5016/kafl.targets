@@ -72,6 +72,12 @@ Vagrant.configure("2") do |config|
 
     config.vm.synced_folder ".", "/vagrant", disabled: true
 
+    config.vm.communicator = "winrm"
+    config.winrm.username = "vagrant"
+    config.winrm.password = "vagrant"
+    config.winrm.transport = :negotiate
+    config.vm.boot_timeout = 600
+
     config.trigger.before :up do |trigger|
         trigger.info = "Unset HTTP_PROXY"
         ENV['HTTP_PROXY'] = nil
