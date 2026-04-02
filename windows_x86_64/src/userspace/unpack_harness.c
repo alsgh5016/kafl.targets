@@ -72,6 +72,77 @@ static char g_target_args[MAX_PATH] = "";  /* Arguments to pass to target proces
 static char g_target_basename[MAX_PATH] = "target";  /* Target filename without extension */
 
 /*
+ * Strip manifest resource from PE file to avoid SxS activation context
+ * errors (ERROR_SXS_CANT_GEN_ACTCTX = 0x36B1) caused by packers like
+ * JDPack that corrupt the manifest data.
+ *
+ * Zeroes the resource directory entry in the PE data directory so
+ * Windows treats the PE as having no manifest at all.
+ */
+static void strip_pe_manifest(const char *pe_path) {
+    HANDLE hFile = CreateFileA(pe_path, GENERIC_READ | GENERIC_WRITE,
+                               0, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    DWORD file_size = GetFileSize(hFile, NULL);
+    if (file_size < 512 || file_size == INVALID_FILE_SIZE) {
+        CloseHandle(hFile);
+        return;
+    }
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return; }
+
+    BYTE *base = (BYTE *)MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, 0);
+    if (!base) { CloseHandle(hMap); CloseHandle(hFile); return; }
+
+    /* Parse PE headers */
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) goto cleanup;
+
+    DWORD pe_off = dos->e_lfanew;
+    if (pe_off + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) > file_size) goto cleanup;
+
+    DWORD pe_sig = *(DWORD *)(base + pe_off);
+    if (pe_sig != IMAGE_NT_SIGNATURE) goto cleanup;
+
+    BYTE *opt = base + pe_off + 4 + sizeof(IMAGE_FILE_HEADER);
+
+    /* Determine 32-bit or 64-bit PE */
+    WORD magic = *(WORD *)opt;
+    DWORD res_dir_offset;
+
+    if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        IMAGE_OPTIONAL_HEADER32 *opt32 = (IMAGE_OPTIONAL_HEADER32 *)opt;
+        if (opt32->NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_RESOURCE) goto cleanup;
+        res_dir_offset = (DWORD)((BYTE *)&opt32->DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE] - base);
+    } else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        IMAGE_OPTIONAL_HEADER64 *opt64 = (IMAGE_OPTIONAL_HEADER64 *)opt;
+        if (opt64->NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_RESOURCE) goto cleanup;
+        res_dir_offset = (DWORD)((BYTE *)&opt64->DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE] - base);
+    } else {
+        goto cleanup;
+    }
+
+    /* Zero the resource directory entry (RVA + Size) */
+    if (res_dir_offset + sizeof(IMAGE_DATA_DIRECTORY) <= file_size) {
+        IMAGE_DATA_DIRECTORY *res_dir = (IMAGE_DATA_DIRECTORY *)(base + res_dir_offset);
+        if (res_dir->VirtualAddress != 0) {
+            hprintf("[+] Stripping resource directory: RVA=0x%X Size=0x%X\n",
+                    (unsigned)res_dir->VirtualAddress, (unsigned)res_dir->Size);
+            res_dir->VirtualAddress = 0;
+            res_dir->Size = 0;
+            FlushViewOfFile(base, 0);
+        }
+    }
+
+cleanup:
+    UnmapViewOfFile(base);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+}
+
+/*
  * Initialize agent handshake with kAFL/Nyx host
  * This must be called before any tracing operations
  */
@@ -864,6 +935,10 @@ int main(int argc, char** argv) {
     } else {
         snprintf(cmdline, sizeof(cmdline), "\"%s\"", target_exe);
     }
+
+    /* Strip manifest resource to prevent SxS errors from packers
+     * that corrupt the manifest (e.g., JDPack → ERROR_SXS_CANT_GEN_ACTCTX) */
+    strip_pe_manifest(target_exe);
 
     hprintf("[+] Creating target process (suspended)...\n");
     hprintf("[+] Command line: %s\n", cmdline);
