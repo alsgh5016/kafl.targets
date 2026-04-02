@@ -23,6 +23,14 @@
 #include <tlhelp32.h>
 #include "nyx_api.h"
 
+/* Mitigation policy definitions (may be missing in older mingw headers) */
+#ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+#define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
+#endif
+#ifndef EXTENDED_STARTUPINFO_PRESENT
+#define EXTENDED_STARTUPINFO_PRESENT 0x00080000
+#endif
+
 /* Configuration */
 #define DEFAULT_TIMEOUT_MS      300000  /* 5 minutes — give packer time to unpack */
 #define MAX_DUMP_SIZE           (64 * 1024 * 1024)  /* 64MB max dump */
@@ -746,7 +754,7 @@ void dump_pt_trace(void) {
  * Main unpacking routine
  */
 int main(int argc, char** argv) {
-    STARTUPINFOA si = {0};
+    STARTUPINFOEXA siex = {0};
     PROCESS_INFORMATION pi = {0};
     
     hprintf("===========================================\n");
@@ -822,8 +830,32 @@ int main(int argc, char** argv) {
     /* Initialize kAFL/Nyx agent */
     init_agent_handshake();
     
-    /* Create target process in suspended state */
-    si.cb = sizeof(si);
+    /* Create target process in suspended state with DEP disabled.
+     * Many packers (FSG, etc.) preserve the original PE's NX_COMPAT flag,
+     * causing DEP to block execution of unpacked code in RWX sections.
+     * Using STARTUPINFOEX + MITIGATION_POLICY to disable DEP for the
+     * child process. */
+    siex.StartupInfo.cb = sizeof(siex);
+
+    /* Set up attribute list for mitigation policy */
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    siex.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(), 0, attr_size);
+    if (!siex.lpAttributeList) {
+        habort("Failed to allocate attribute list\n");
+        return 1;
+    }
+    InitializeProcThreadAttributeList(siex.lpAttributeList, 1, 0, &attr_size);
+
+    /* Disable DEP (PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE = 0x01,
+     * we set it to 0 = disable) */
+    DWORD64 mitigation_policy = 0;  /* All mitigations disabled */
+    UpdateProcThreadAttribute(
+        siex.lpAttributeList, 0,
+        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+        &mitigation_policy, sizeof(mitigation_policy),
+        NULL, NULL);
 
     /* Build command line: "target.exe" + args */
     char cmdline[MAX_PATH * 2] = {0};
@@ -842,15 +874,21 @@ int main(int argc, char** argv) {
             NULL,
             NULL,
             FALSE,
-            CREATE_SUSPENDED,  /* Suspended only - no debug flags for anti-debug evasion */
+            CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
             NULL,
             NULL,
-            &si,
+            &siex.StartupInfo,
             &pi)) {
         hprintf("[-] CreateProcess failed: 0x%X\n", GetLastError());
+        DeleteProcThreadAttributeList(siex.lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, siex.lpAttributeList);
         habort("Failed to create target process\n");
         return 1;
     }
+
+    /* Clean up attribute list (no longer needed after process creation) */
+    DeleteProcThreadAttributeList(siex.lpAttributeList);
+    HeapFree(GetProcessHeap(), 0, siex.lpAttributeList);
     
     g_target.process = pi.hProcess;
     g_target.thread = pi.hThread;
