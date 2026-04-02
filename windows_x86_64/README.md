@@ -157,6 +157,25 @@ results/<sample_name>/
   result.json              # 분석 결과 (status, duration, wte_count)
 ```
 
+### Worker vCPU 수 조정
+
+워커 VM의 vCPU는 기본 4개. 물리 코어가 부족한 환경에서는 줄여야 한다.
+(예: 6코어 호스트에서 워커 4개 × vCPU 4개 = 20 vCPU → 커널 soft lockup 발생)
+
+`batch_analyze.py` 92~93번 줄의 Vagrantfile 템플릿에서 수정:
+
+```ruby
+# 기본값 (vCPU 4개)
+libvirt.cpus = 4
+libvirt.cputopology :sockets => '1', :cores => '4', :threads => '1'
+
+# 6코어 환경 권장 (vCPU 2개 × 워커 2개)
+libvirt.cpus = 2
+libvirt.cputopology :sockets => '1', :cores => '2', :threads => '1'
+```
+
+언패킹은 단일 스레드로 동작하므로 vCPU 2개로도 성능 차이가 거의 없다.
+
 ## Troubleshooting
 
 ### Worker VM 잔여 프로세스
