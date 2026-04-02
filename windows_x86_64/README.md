@@ -98,6 +98,37 @@ python3 batch_analyze.py status
 python3 batch_analyze.py teardown
 ```
 
+## auto_batch.py (자동 반복 실행)
+
+워커 관리 + 배치 실행 + 결과 정리를 완료될 때까지 자동 반복한다.
+
+```bash
+# 첫 실행 (워커 setup 포함, 완료될 때까지 자동 반복)
+python3 auto_batch.py ./targets/ -o ./batch_results -n 4 -t 600 -w /root/kafl_workdir
+
+# 워커가 이미 있으면 기존 워커 재활용, 실패 시 자동 teardown + re-setup
+```
+
+**동작 흐름:**
+
+1. **Round 1**: 워커 setup (없으면) → batch 실행 → cleanup → 완료된 .exe 삭제
+2. **Round 2+**: 남은 샘플 있으면 → teardown → 새 워커 setup → batch → cleanup
+3. **종료 조건**: 모든 샘플 완료 / max rounds 도달 / 3라운드 연속 진전 없음
+
+## cleanup_results.py (결과 정리)
+
+배치 분석 후 빈 결과와 완료된 샘플을 정리한다.
+
+```bash
+python3 cleanup_results.py --results-dir ./batch_results --targets-dir ./targets
+
+# dry-run (실제 삭제 없이 확인만)
+python3 cleanup_results.py --results-dir ./batch_results --targets-dir ./targets --dry-run
+```
+
+- 덤프 파일이 없는 빈 결과 디렉토리 제거
+- 성공적으로 처리된 .exe 파일을 targets 디렉토리에서 삭제
+
 ## Configuration
 
 ### kafl.yaml
