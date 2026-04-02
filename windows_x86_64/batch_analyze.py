@@ -328,7 +328,7 @@ def _init_worker_vm(worker_dir: Path) -> None:
     """Initialize worker VM: vagrant up -> snapshot save -> halt."""
     _run_cmd(
         ["vagrant", "up", "--no-provision"],
-        cwd=worker_dir, timeout=600,
+        cwd=worker_dir, timeout=900,
         label="vagrant up",
     )
     _run_cmd(
