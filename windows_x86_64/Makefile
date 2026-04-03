@@ -11,7 +11,7 @@ ansible: $(ROOT_DIR)/venv/bin/ansible-playbook
 
 init:
 	vagrant up --no-provision
-	vagrant snapshot save 'ready_provision'
+	vagrant snapshot save --force 'ready_provision'
 
 compile:
 	mkdir -p bin/{userspace,driver}
