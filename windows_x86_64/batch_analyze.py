@@ -609,6 +609,8 @@ def run_kafl(
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
+        # Kill any orphaned QEMU children that survived process group kill
+        _cleanup_kafl(workdir, worker)
         raise subprocess.TimeoutExpired(cmd, timeout, stdout, stderr)
 
     elapsed = time.time() - start
@@ -630,7 +632,15 @@ def run_kafl(
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
-    """Kill the process and its entire process group."""
+    """Kill the process, its process group, and all descendant processes.
+
+    Uses /proc traversal to find children that escaped the process group
+    (e.g. QEMU spawned by kafl with a new session).
+    """
+    # Collect all descendant PIDs before killing anything
+    descendants = _get_descendant_pids(proc.pid)
+
+    # 1) Kill the process group (covers same-session children)
     try:
         pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGTERM)
@@ -640,6 +650,30 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
             os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+    # 2) Kill any descendants that survived (different session/group)
+    for pid in descendants:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            logger.debug("Killed orphaned descendant PID %d", pid)
+        except ProcessLookupError:
+            pass
+
+
+def _get_descendant_pids(parent_pid: int) -> list[int]:
+    """Recursively find all descendant PIDs using ps (portable)."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "pid=", "--ppid", str(parent_pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        children = [int(p.strip()) for p in result.stdout.split() if p.strip()]
+    except Exception:
+        return []
+    descendants = list(children)
+    for child in children:
+        descendants.extend(_get_descendant_pids(child))
+    return descendants
 
 
 # -- Result Validation & Collection --
@@ -724,12 +758,30 @@ def _safe_validate(workdir: Path) -> tuple[bool, int, Optional[int]]:
 
 
 def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
-    """Kill stray QEMU processes scoped to a workdir or worker disk image."""
+    """Kill stray QEMU processes scoped to a workdir or worker disk image.
+
+    Uses multiple patterns to catch QEMU processes that may have been spawned
+    with different argument orderings.  SIGTERM first for graceful exit, then
+    SIGKILL after a brief grace period.
+    """
     patterns = [f"qemu-system-x86_64.*{re.escape(str(workdir))}"]
     if worker is not None:
         patterns.append(
             f"qemu-system-x86_64.*{re.escape(str(worker.disk_image))}"
         )
+    # First pass: SIGTERM for graceful shutdown
+    for pattern in patterns:
+        try:
+            subprocess.run(
+                ["pkill", "-TERM", "-f", pattern],
+                timeout=10, capture_output=True,
+            )
+        except Exception as exc:
+            logger.debug("pkill TERM failed (non-critical): %s", exc)
+
+    time.sleep(SIGTERM_GRACE)
+
+    # Second pass: SIGKILL for anything that survived
     for pattern in patterns:
         try:
             subprocess.run(
@@ -737,7 +789,7 @@ def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
                 timeout=10, capture_output=True,
             )
         except Exception as exc:
-            logger.debug("pkill cleanup failed (non-critical): %s", exc)
+            logger.debug("pkill KILL failed (non-critical): %s", exc)
     # Brief pause to let OS reclaim resources
     time.sleep(1)
 
@@ -754,7 +806,7 @@ def process_sample(
 
     Pipeline: provision VM -> run kafl -> validate -> collect results.
     """
-    sample_name = sample_path.stem
+    sample_name = sample_path.stem.replace(" ", "_")
     start = time.time()
     workdir = config.workdir_base / sample_name
     result: Optional[SampleResult] = None
