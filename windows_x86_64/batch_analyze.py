@@ -288,17 +288,24 @@ def _destroy_worker_vm(worker_dir: Path) -> None:
             if result.returncode != 0:
                 continue
             state = result.stdout.strip()
-            if state == "running":
+            # Any active state (running, paused, etc.) needs destroy first
+            if state not in ("shut off", ""):
                 subprocess.run(
                     ["virsh", "-c", conn, "destroy", domain_name],
                     capture_output=True, text=True, timeout=30,
                 )
-            subprocess.run(
+            undef = subprocess.run(
                 ["virsh", "-c", conn, "undefine", domain_name,
                  "--remove-all-storage", "--snapshots-metadata"],
                 capture_output=True, text=True, timeout=30,
             )
-            logger.info("Removed lingering domain %s via %s", domain_name, conn)
+            if undef.returncode == 0:
+                logger.info("Removed lingering domain %s via %s", domain_name, conn)
+            else:
+                logger.warning(
+                    "virsh undefine failed for %s via %s: %s",
+                    domain_name, conn, undef.stderr.strip(),
+                )
         except Exception as e:
             logger.debug("virsh cleanup failed for %s (%s): %s", domain_name, conn, e)
 
@@ -450,6 +457,13 @@ def teardown_workers(project_dir: Path) -> None:
     for w in workers:
         logger.info("Destroying worker %d (%s)...", w.worker_id, w.vm_name)
         _destroy_worker_vm(w.worker_dir)
+
+    # Also scan for worker dirs not in config (e.g. setup crashed before saving)
+    known_dirs = {w.worker_dir for w in workers}
+    for entry in sorted(workers_base.iterdir()):
+        if entry.is_dir() and entry.name.startswith("worker") and entry not in known_dirs:
+            logger.info("Cleaning up orphaned worker dir: %s", entry.name)
+            _destroy_worker_vm(entry)
 
     # Prune stale vagrant global-status entries
     try:
