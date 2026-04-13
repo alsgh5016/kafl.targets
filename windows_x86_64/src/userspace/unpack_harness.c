@@ -971,26 +971,30 @@ int main(int argc, char** argv) {
     g_target.pid = pi.dwProcessId;
     
     hprintf("[+] Process created: PID %d\n", g_target.pid);
-    
-    
+
+    /* === ISOLATION TEST: skip all pre-resume operations ===
+     * Disable PEB read, PE parse, pre-fault, WTE_SETUP to test if
+     * bare CreateProcess(SUSPENDED) + ResumeThread triggers Obsidium. */
+#define OBSIDIUM_ISOLATION_TEST 1
+#if !OBSIDIUM_ISOLATION_TEST
     /* Get process base address via PEB */
     PROCESS_BASIC_INFORMATION pbi;
     ULONG len;
-    
-    if (NtQueryInformationProcess(pi.hProcess, ProcessBasicInformation, 
+
+    if (NtQueryInformationProcess(pi.hProcess, ProcessBasicInformation,
                                   &pbi, sizeof(pbi), &len) == 0) {
         UINT64 peb_addr = (UINT64)pbi.PebBaseAddress;
         UINT64 image_base;
         SIZE_T bytes_read;
-        
+
         /* PEB.ImageBaseAddress is at offset 0x10 in 64-bit PEB */
-        if (ReadProcessMemory(pi.hProcess, 
-                             (LPCVOID)(peb_addr + 0x10), 
-                             &image_base, 
-                             sizeof(image_base), 
+        if (ReadProcessMemory(pi.hProcess,
+                             (LPCVOID)(peb_addr + 0x10),
+                             &image_base,
+                             sizeof(image_base),
                              &bytes_read)) {
             hprintf("[+] Image base from PEB: 0x%llx\n", image_base);
-            
+
             /* Parse PE headers */
             if (!parse_pe_headers(pi.hProcess, image_base)) {
                 hprintf("[-] Failed to parse PE headers\n");
@@ -998,14 +1002,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* Pre-fault disabled — WriteProcessMemory triggers integrity check
-     * failures in packers like Obsidium. Testing without it to isolate
-     * the anti-tamper issue. WtE coverage may degrade (unmapped pages). */
-    /* if (g_target.image_base && g_target.size_of_image > 0) {
+    if (g_target.image_base && g_target.size_of_image > 0) {
         prefault_pe_pages(pi.hProcess, g_target.image_base,
                           g_target.size_of_image);
-    } */
+    }
+#endif /* !OBSIDIUM_ISOLATION_TEST */
     
+#if !OBSIDIUM_ISOLATION_TEST
     /* ── WTE_SETUP: Initialize WtE BEFORE target executes ──────────────
      * QEMU will:
      *   1. Create root snapshot (baseline memory content)
@@ -1036,31 +1039,25 @@ int main(int argc, char** argv) {
         hprintf("[+] WTE_SETUP success: child CR3=0x%llx\n",
                 (unsigned long long)child_cr3);
 
-        /* Submit harness CR3 for Intel PT filtering.
-         * NOTE: KVM always replaces the arg with current vCPU CR3 for
-         * SUBMIT_CR3, so passing child_cr3 here has no effect.
-         * Pass 0 to explicitly request auto-capture of harness CR3.
-         * WtE target CR3 (child process) is already set by WTE_SETUP
-         * and QEMU's SUBMIT_CR3 handler preserves it when WtE is active. */
         kAFL_hypercall(HYPERCALL_KAFL_SUBMIT_CR3, 0);
         hprintf("[+] Harness CR3 submitted for Intel PT filtering\n");
     }
 
-    /* Setup API hooks AFTER child CR3 is submitted so QEMU uses correct CR3 */
-    // [TEST] setup_api_hooks();  /* disabled to test if INT3 hooks cause VMP to exit */
-    /* Set IP range for Intel PT to cover unpacking stub and OEP */
-    /* Range 0: Entire image for now (packer + unpacked code) */
+    // [TEST] setup_api_hooks();
     if (g_target.image_base && g_target.size_of_image > 0) {
         set_ip_range_usermode(g_target.image_base, g_target.size_of_image, 0);
-        
-        /* Verify entry point is with in IP range */
-        if (g_target.entry_point < g_target.image_base || 
+
+        if (g_target.entry_point < g_target.image_base ||
             g_target.entry_point >= g_target.image_base + g_target.size_of_image) {
             hprintf("[!] WARNING: Entry point 0x%llx is outside IP range 0x%llx - 0x%llx\n",
                     g_target.entry_point, g_target.image_base,
                     g_target.image_base + g_target.size_of_image);
         }
     }
+#else
+    hprintf("[!] ISOLATION TEST: skipping PEB/PE/prefault/WTE_SETUP\n");
+    hprintf("[!] Only CreateProcess(SUSPENDED) + ResumeThread\n");
+#endif /* !OBSIDIUM_ISOLATION_TEST */
     
     /* No debug detach needed - we don't use DEBUG_PROCESS */
     /* This avoids anti-debug detection by VMProtect */
