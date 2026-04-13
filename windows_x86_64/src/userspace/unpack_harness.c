@@ -998,19 +998,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* ── Pre-fault PE pages BEFORE WTE_SETUP ───────────────────────────
-     * Windows demand paging means most PE pages aren't in physical memory
-     * until accessed. QEMU's eager NX logic can only set NX on pages that
-     * are currently mapped. By pre-faulting all PE pages here, we ensure
-     * QEMU can set NX on ALL pages, not just the 3-4 that happen to be
-     * mapped at process creation time.
-     * 
-     * Without this, addresses like 0x406afa (OEP) might be unmapped when
-     * WTE_SETUP runs, causing WtE detection to miss critical events. */
-    if (g_target.image_base && g_target.size_of_image > 0) {
-        prefault_pe_pages(pi.hProcess, g_target.image_base, 
+    /* Pre-fault disabled — WriteProcessMemory triggers integrity check
+     * failures in packers like Obsidium. Testing without it to isolate
+     * the anti-tamper issue. WtE coverage may degrade (unmapped pages). */
+    /* if (g_target.image_base && g_target.size_of_image > 0) {
+        prefault_pe_pages(pi.hProcess, g_target.image_base,
                           g_target.size_of_image);
-    }
+    } */
     
     /* ── WTE_SETUP: Initialize WtE BEFORE target executes ──────────────
      * QEMU will:
