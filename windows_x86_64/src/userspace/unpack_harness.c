@@ -941,7 +941,7 @@ int main(int argc, char** argv) {
      * TODO: re-enable conditionally for JDPack if needed. */
     /* strip_pe_manifest(target_exe); */
 
-    hprintf("[+] Creating target process (suspended)...\n");
+    hprintf("[+] Creating target process (non-suspended)...\n");
     hprintf("[+] Command line: %s\n", cmdline);
 
     if (!CreateProcessA(
@@ -950,7 +950,7 @@ int main(int argc, char** argv) {
             NULL,
             NULL,
             FALSE,
-            CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+            EXTENDED_STARTUPINFO_PRESENT,  /* No CREATE_SUSPENDED — avoids anti-debug */
             NULL,
             NULL,
             &siex.StartupInfo,
@@ -962,6 +962,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* Immediately suspend to regain control after TLS callbacks / packer
+     * init have passed anti-debug checks. There is a race here — some
+     * unpacking may already have started. */
+    SuspendThread(pi.hThread);
+    hprintf("[+] Thread suspended after creation\n");
+
     /* Clean up attribute list (no longer needed after process creation) */
     DeleteProcThreadAttributeList(siex.lpAttributeList);
     HeapFree(GetProcessHeap(), 0, siex.lpAttributeList);
@@ -972,11 +978,6 @@ int main(int argc, char** argv) {
     
     hprintf("[+] Process created: PID %d\n", g_target.pid);
 
-    /* === ISOLATION TEST: skip all pre-resume operations ===
-     * Disable PEB read, PE parse, pre-fault, WTE_SETUP to test if
-     * bare CreateProcess(SUSPENDED) + ResumeThread triggers Obsidium. */
-#define OBSIDIUM_ISOLATION_TEST 1
-#if !OBSIDIUM_ISOLATION_TEST
     /* Get process base address via PEB */
     PROCESS_BASIC_INFORMATION pbi;
     ULONG len;
@@ -1002,20 +1003,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (g_target.image_base && g_target.size_of_image > 0) {
+    /* Pre-fault disabled — triggers Obsidium integrity check */
+    /* if (g_target.image_base && g_target.size_of_image > 0) {
         prefault_pe_pages(pi.hProcess, g_target.image_base,
                           g_target.size_of_image);
-    }
-#endif /* !OBSIDIUM_ISOLATION_TEST */
+    } */
     
-#if !OBSIDIUM_ISOLATION_TEST
-    /* ── WTE_SETUP: Initialize WtE BEFORE target executes ──────────────
-     * QEMU will:
-     *   1. Create root snapshot (baseline memory content)
-     *   2. Walk EPROCESS to find child CR3 by PID
-     *   3. wte_init() + wte_activate(child_cr3)
-     *   4. Eagerly set EPT NX on all target PE pages
-     * This ensures the FIRST instruction of the target triggers WtE. */
+    /* ── WTE_SETUP: Initialize WtE BEFORE target resumes ─────────────── */
     {
         kafl_wte_setup_t wte_setup = {0};
         wte_setup.target_pid  = (uint64_t)g_target.pid;
@@ -1043,7 +1037,6 @@ int main(int argc, char** argv) {
         hprintf("[+] Harness CR3 submitted for Intel PT filtering\n");
     }
 
-    // [TEST] setup_api_hooks();
     if (g_target.image_base && g_target.size_of_image > 0) {
         set_ip_range_usermode(g_target.image_base, g_target.size_of_image, 0);
 
@@ -1054,10 +1047,6 @@ int main(int argc, char** argv) {
                     g_target.image_base + g_target.size_of_image);
         }
     }
-#else
-    hprintf("[!] ISOLATION TEST: skipping PEB/PE/prefault/WTE_SETUP\n");
-    hprintf("[!] Only CreateProcess(SUSPENDED) + ResumeThread\n");
-#endif /* !OBSIDIUM_ISOLATION_TEST */
     
     /* No debug detach needed - we don't use DEBUG_PROCESS */
     /* This avoids anti-debug detection by VMProtect */
