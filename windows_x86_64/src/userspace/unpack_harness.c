@@ -825,7 +825,7 @@ void dump_pt_trace(void) {
  * Main unpacking routine
  */
 int main(int argc, char** argv) {
-    /* STARTUPINFOEXA siex = {0}; — removed, using plain STARTUPINFOA */
+    STARTUPINFOEXA siex = {0};
     PROCESS_INFORMATION pi = {0};
     
     hprintf("===========================================\n");
@@ -901,6 +901,26 @@ int main(int argc, char** argv) {
     /* Initialize kAFL/Nyx agent */
     init_agent_handshake();
     
+    /* Create target process in suspended state with DEP disabled. */
+    siex.StartupInfo.cb = sizeof(siex);
+
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    siex.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(), 0, attr_size);
+    if (!siex.lpAttributeList) {
+        habort("Failed to allocate attribute list\n");
+        return 1;
+    }
+    InitializeProcThreadAttributeList(siex.lpAttributeList, 1, 0, &attr_size);
+
+    DWORD64 mitigation_policy = 0;  /* All mitigations disabled */
+    UpdateProcThreadAttribute(
+        siex.lpAttributeList, 0,
+        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+        &mitigation_policy, sizeof(mitigation_policy),
+        NULL, NULL);
+
     /* Build command line: "target.exe" + args */
     char cmdline[MAX_PATH * 2] = {0};
     if (g_target_args[0]) {
@@ -909,17 +929,10 @@ int main(int argc, char** argv) {
         snprintf(cmdline, sizeof(cmdline), "\"%s\"", target_exe);
     }
 
-    /* Resource strip disabled — breaks packers with integrity checks */
-    /* strip_pe_manifest(target_exe); */
+    strip_pe_manifest(target_exe);
 
-    hprintf("[+] Creating target process (plain, no flags)...\n");
+    hprintf("[+] Creating target process (suspended)...\n");
     hprintf("[+] Command line: %s\n", cmdline);
-
-    /* Plain CreateProcessA — no EXTENDED_STARTUPINFO, no DEP disable,
-     * no CREATE_SUSPENDED. Mimics explorer.exe double-click as closely
-     * as possible to avoid Obsidium anti-tamper detection. */
-    STARTUPINFOA si = {0};
-    si.cb = sizeof(si);
 
     if (!CreateProcessA(
             NULL,
@@ -927,19 +940,20 @@ int main(int argc, char** argv) {
             NULL,
             NULL,
             FALSE,
-            0,                 /* No flags at all */
+            CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
             NULL,
             NULL,
-            &si,
+            &siex.StartupInfo,
             &pi)) {
         hprintf("[-] CreateProcess failed: 0x%X\n", GetLastError());
+        DeleteProcThreadAttributeList(siex.lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, siex.lpAttributeList);
         habort("Failed to create target process\n");
         return 1;
     }
 
-    /* Immediately suspend to regain control */
-    SuspendThread(pi.hThread);
-    hprintf("[+] Thread suspended after creation\n");
+    DeleteProcThreadAttributeList(siex.lpAttributeList);
+    HeapFree(GetProcessHeap(), 0, siex.lpAttributeList);
     
     g_target.process = pi.hProcess;
     g_target.thread = pi.hThread;
@@ -972,11 +986,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* Pre-fault disabled — triggers Obsidium integrity check */
-    /* if (g_target.image_base && g_target.size_of_image > 0) {
+    if (g_target.image_base && g_target.size_of_image > 0) {
         prefault_pe_pages(pi.hProcess, g_target.image_base,
                           g_target.size_of_image);
-    } */
+    }
     
     /* ── WTE_SETUP: Initialize WtE BEFORE target resumes ─────────────── */
     {
