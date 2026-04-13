@@ -936,9 +936,10 @@ int main(int argc, char** argv) {
         snprintf(cmdline, sizeof(cmdline), "\"%s\"", target_exe);
     }
 
-    /* Strip manifest resource to prevent SxS errors from packers
-     * that corrupt the manifest (e.g., JDPack → ERROR_SXS_CANT_GEN_ACTCTX) */
-    strip_pe_manifest(target_exe);
+    /* Resource strip disabled — breaks packers with integrity checks
+     * (e.g., Obsidium checksum verification fails after modification).
+     * TODO: re-enable conditionally for JDPack if needed. */
+    /* strip_pe_manifest(target_exe); */
 
     hprintf("[+] Creating target process (suspended)...\n");
     hprintf("[+] Command line: %s\n", cmdline);
