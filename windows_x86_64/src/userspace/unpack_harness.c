@@ -929,7 +929,7 @@ int main(int argc, char** argv) {
         snprintf(cmdline, sizeof(cmdline), "\"%s\"", target_exe);
     }
 
-    strip_pe_manifest(target_exe);
+    /* strip_pe_manifest(target_exe); */
 
     hprintf("[+] Creating target process (suspended)...\n");
     hprintf("[+] Command line: %s\n", cmdline);
