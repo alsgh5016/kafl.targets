@@ -17,7 +17,6 @@
  */
 
 #include <windows.h>
-#include <intrin.h>
 #include <stdio.h>
 #include <winternl.h>
 #include <psapi.h>
@@ -899,16 +898,6 @@ int main(int argc, char** argv) {
     hprintf("[+] Dump mode: %d\n", g_dump_mode);
     hprintf("[+] Output prefix: %s\n\n", g_output_prefix);
     
-    /* Log CPUID brand string for VM detection debugging */
-    {
-        int regs[4];
-        char brand[49] = {0};
-        __cpuid(regs, 0x80000002); memcpy(brand +  0, regs, 16);
-        __cpuid(regs, 0x80000003); memcpy(brand + 16, regs, 16);
-        __cpuid(regs, 0x80000004); memcpy(brand + 32, regs, 16);
-        hprintf("[+] CPUID brand: %s\n", brand);
-    }
-
     /* Initialize kAFL/Nyx agent */
     init_agent_handshake();
     
