@@ -193,9 +193,116 @@ void set_ip_range_usermode(UINT64 base, UINT64 size, int index) {
     buffer[0] = base;
     buffer[1] = base + size;
     buffer[2] = index;
-    
+
     kAFL_hypercall(HYPERCALL_KAFL_RANGE_SUBMIT, (UINT64)buffer);
     hprintf("[+] Unpacker: IP range %d set to 0x%llx - 0x%llx\n", index, base, base + size);
+}
+
+/* ── Dynamic IP range expansion (Phase 1) ──────────────────────────
+ * Walk the target process VAD via VirtualQueryEx and re-submit IP
+ * ranges so PT captures relocated images and dynamically allocated
+ * RWX regions (packer unpacking buffers).
+ *
+ * Strategy:
+ *   - Index 0 is pinned to original packed image (image_base..size).
+ *   - Indices 1..3 = top executable VADs by size.
+ *   - Prefer MEM_PRIVATE executable (VirtualAlloc'd by packer).
+ *   - MEM_IMAGE candidates only if base == g_target.image_base.
+ *
+ * Re-submits only when set differs from previous submission.
+ */
+#define WTE_MAX_PT_RANGES 4
+typedef struct {
+    UINT64 base;
+    UINT64 size;
+} ip_range_t;
+
+static ip_range_t g_submitted[WTE_MAX_PT_RANGES] = {0};
+static int g_submitted_count = 0;
+
+static int collect_executable_vads(HANDLE hProcess, ip_range_t* out, int max_count) {
+    MEMORY_BASIC_INFORMATION mbi;
+    UINT64 addr = 0;
+    int n = 0;
+    const DWORD exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    while (n < max_count &&
+           VirtualQueryEx(hProcess, (LPCVOID)(uintptr_t)addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        UINT64 region_base = (UINT64)(uintptr_t)mbi.BaseAddress;
+        UINT64 region_size = (UINT64)mbi.RegionSize;
+        if (region_size == 0) break;
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & exec_mask)) {
+            int keep = 0;
+            if (mbi.Type == MEM_PRIVATE) {
+                keep = 1; /* packer-allocated RWX/RX — always interesting */
+            } else if (mbi.Type == MEM_IMAGE && region_base == g_target.image_base) {
+                keep = 1; /* original packed image */
+            }
+            if (keep) {
+                out[n].base = region_base;
+                out[n].size = region_size;
+                n++;
+            }
+        }
+        UINT64 next = region_base + region_size;
+        if (next <= addr) break;
+        addr = next;
+    }
+    return n;
+}
+
+/* Insertion-sort by size descending */
+static void sort_by_size_desc(ip_range_t* a, int n) {
+    for (int i = 1; i < n; i++) {
+        ip_range_t k = a[i];
+        int j = i - 1;
+        while (j >= 0 && a[j].size < k.size) { a[j+1] = a[j]; j--; }
+        a[j+1] = k;
+    }
+}
+
+static int ranges_equal(const ip_range_t* a, int an, const ip_range_t* b, int bn) {
+    if (an != bn) return 0;
+    for (int i = 0; i < an; i++) {
+        if (a[i].base != b[i].base || a[i].size != b[i].size) return 0;
+    }
+    return 1;
+}
+
+void update_ip_ranges_dynamic(HANDLE hProcess) {
+    ip_range_t cands[64];
+    int n = collect_executable_vads(hProcess, cands, 64);
+    if (n == 0) return;
+
+    ip_range_t chosen[WTE_MAX_PT_RANGES] = {0};
+    int chosen_n = 0;
+
+    /* Pin original image at index 0 if present */
+    for (int i = 0; i < n; i++) {
+        if (cands[i].base == g_target.image_base) {
+            chosen[chosen_n++] = cands[i];
+            cands[i].size = 0; /* mark used */
+            break;
+        }
+    }
+
+    /* Fill remaining slots with largest executable VADs */
+    sort_by_size_desc(cands, n);
+    for (int i = 0; i < n && chosen_n < WTE_MAX_PT_RANGES; i++) {
+        if (cands[i].size == 0) continue;
+        chosen[chosen_n++] = cands[i];
+    }
+
+    if (ranges_equal(chosen, chosen_n, g_submitted, g_submitted_count)) {
+        return; /* no change */
+    }
+
+    hprintf("[+] IP range update: %d region(s)\n", chosen_n);
+    for (int i = 0; i < chosen_n; i++) {
+        set_ip_range_usermode(chosen[i].base, chosen[i].size, i);
+        g_submitted[i] = chosen[i];
+    }
+    g_submitted_count = chosen_n;
 }
 
 /*
@@ -1021,6 +1128,9 @@ int main(int argc, char** argv) {
 
     if (g_target.image_base && g_target.size_of_image > 0) {
         set_ip_range_usermode(g_target.image_base, g_target.size_of_image, 0);
+        g_submitted[0].base = g_target.image_base;
+        g_submitted[0].size = g_target.size_of_image;
+        g_submitted_count = 1;
 
         if (g_target.entry_point < g_target.image_base ||
             g_target.entry_point >= g_target.image_base + g_target.size_of_image) {
@@ -1059,17 +1169,31 @@ int main(int argc, char** argv) {
     ResumeThread(pi.hThread);
     hprintf("[+] Target process resumed\n");
 
-    /* 3. Wait for unpacking activity */
-    DWORD wait_result = WaitForSingleObject(pi.hProcess, wait_timeout);
+    /* 3. Wait for unpacking activity — poll periodically to refresh IP
+     *    ranges as the target relocates / VirtualAlloc's RWX regions. */
+    DWORD start_tick = GetTickCount();
+    DWORD poll_interval_ms = 1000;
+    DWORD wait_result = WAIT_TIMEOUT;
+    while (1) {
+        wait_result = WaitForSingleObject(pi.hProcess, poll_interval_ms);
+        if (wait_result == WAIT_OBJECT_0) {
+            DWORD exit_code = 0;
+            GetExitCodeProcess(pi.hProcess, &exit_code);
+            hprintf("[!] Process exited (code %d)\n", exit_code);
+            break;
+        }
+        /* Refresh PT IP filter ranges from current target VAD */
+        update_ip_ranges_dynamic(pi.hProcess);
 
-    if (wait_result == WAIT_OBJECT_0) {
-        DWORD exit_code = 0;
-        GetExitCodeProcess(pi.hProcess, &exit_code);
-        hprintf("[!] Process exited (code %d)\n", exit_code);
-    } else if (wait_result == WAIT_TIMEOUT) {
-        /* 4. Suspend target */
-        hprintf("[+] Timeout reached \xe2\x80\x94 suspending target\n");
-        SuspendThread(pi.hThread);
+        if (g_timeout_ms != 0) {
+            DWORD elapsed = GetTickCount() - start_tick;
+            if (elapsed >= g_timeout_ms) {
+                hprintf("[+] Timeout reached \xe2\x80\x94 suspending target\n");
+                SuspendThread(pi.hThread);
+                wait_result = WAIT_TIMEOUT;
+                break;
+            }
+        }
     }
 
     /* 5. Stop tracing — RELEASE returns WtE count */
