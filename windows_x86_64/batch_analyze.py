@@ -89,8 +89,8 @@ Vagrant.configure("2") do |config|
     config.vm.provider :libvirt do |libvirt|
         libvirt.uri = "qemu:///session"
         libvirt.graphics_type = "spice"
-        libvirt.cpus = 4
-        libvirt.cputopology :sockets => '1', :cores => '4', :threads => '1'
+        libvirt.cpus = 2
+        libvirt.cputopology :sockets => '1', :cores => '2', :threads => '1'
         libvirt.memory = 4096
     end
 
