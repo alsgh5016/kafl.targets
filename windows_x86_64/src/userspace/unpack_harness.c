@@ -1182,8 +1182,14 @@ int main(int argc, char** argv) {
             hprintf("[!] Process exited (code %d)\n", exit_code);
             break;
         }
-        /* Refresh PT IP filter ranges from current target VAD */
-        update_ip_ranges_dynamic(pi.hProcess);
+        /* NOTE: Dynamic IP range update disabled mid-fuzz.
+         * HYPERCALL_KAFL_RANGE_SUBMIT is blocked after ACQUIRE by
+         * the kAFL frontend, causing a fuzzing abort. Need to either
+         * (a) allow-list RANGE_SUBMIT in the frontend, or
+         * (b) add a new WTE_* hypercall that relays range updates
+         * through a fuzz-safe path. Until then, only the initial
+         * pre-ACQUIRE submission is active. */
+        /* update_ip_ranges_dynamic(pi.hProcess); — disabled */
 
         if (g_timeout_ms != 0) {
             DWORD elapsed = GetTickCount() - start_tick;
