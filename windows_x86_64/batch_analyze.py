@@ -807,6 +807,43 @@ def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
     # Brief pause to let OS reclaim resources
     time.sleep(1)
 
+    # ── Aggressive residue cleanup for this workdir ─────────────────
+    # When QEMU crashes mid-run it leaves shm segments, stale sockets,
+    # and fragmented pages.  Clearing these between samples prevents
+    # cascading ToPA / Broken-pipe failures over long batches.
+    try:
+        # 1) Per-workdir monitor sockets & lock files
+        for pat in ("monitor.sock", "*.lock", "*.pid"):
+            for p in Path(workdir).rglob(pat):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+    except Exception as exc:
+        logger.debug("workdir residue cleanup failed: %s", exc)
+
+    try:
+        # 2) Orphan Nyx/kAFL shm segments (best-effort, global)
+        for shm in Path("/dev/shm").glob("kafl_*"):
+            try:
+                shm.unlink()
+            except OSError:
+                pass
+        for shm in Path("/dev/shm").glob("nyx_*"):
+            try:
+                shm.unlink()
+            except OSError:
+                pass
+    except Exception as exc:
+        logger.debug("/dev/shm cleanup failed: %s", exc)
+
+    try:
+        # 3) Trigger memory compaction to refresh Order-9 (2MB) pool
+        #    used by Intel PT ToPA buffer allocation.
+        Path("/proc/sys/vm/compact_memory").write_text("1\n")
+    except Exception as exc:
+        logger.debug("compact_memory failed: %s", exc)
+
 
 # -- Single Sample Processing --
 
