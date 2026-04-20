@@ -730,7 +730,14 @@ def _get_descendant_pids(parent_pid: int) -> list[int]:
 
 
 def validate_results(workdir: Path) -> tuple[bool, int, Optional[int]]:
-    """Check analysis results by parsing hprintf log."""
+    """Check analysis results by parsing hprintf log and dump artifacts.
+
+    Success criteria (any of):
+      1. hprintf contains a known success marker, OR
+      2. dump directory has WtE fulldump directories (dumps > 0)
+    The second criterion catches timeout cases where the harness was
+    killed before printing the completion message but WtE dumps exist.
+    """
     hprintf_log = workdir / "hprintf_00.log"
     success = False
     wte_count = None
@@ -749,6 +756,27 @@ def validate_results(workdir: Path) -> tuple[bool, int, Optional[int]]:
     dump_dir = workdir / "dump"
     if dump_dir.is_dir():
         dump_count = sum(1 for f in dump_dir.rglob("*") if f.is_file())
+
+    # Fallback WtE count from timeline if hprintf didn't report it
+    if wte_count is None:
+        tl = dump_dir / "wte_timeline.txt" if dump_dir.is_dir() else None
+        if tl and tl.exists():
+            lines = [l for l in tl.read_text(errors="replace").splitlines()
+                     if l.strip() and not l.startswith("#")]
+            # Exclude EP_INIT line (seq 000)
+            wte_lines = [l for l in lines if "EP_INIT" not in l]
+            if wte_lines:
+                wte_count = len(wte_lines)
+
+    # If dumps exist (beyond EP_INIT fulldump_000), consider it a success
+    if not success and dump_count > 0:
+        # Count actual WtE fulldump directories (not just files)
+        if dump_dir.is_dir():
+            wte_dumps = [d for d in dump_dir.iterdir()
+                         if d.is_dir() and d.name.startswith("fulldump_")
+                         and "ep_initial" not in d.name]
+            if wte_dumps:
+                success = True
 
     return success, dump_count, wte_count
 
@@ -945,13 +973,13 @@ def process_sample(
 
     except subprocess.TimeoutExpired:
         duration = time.time() - start
-        _, dump_count, wte_count = _safe_validate(workdir)
+        success, dump_count, wte_count = _safe_validate(workdir)
         result = SampleResult(
             sample_name=sample_name,
-            status=SampleStatus.TIMEOUT,
+            status=SampleStatus.SUCCESS if success else SampleStatus.TIMEOUT,
             duration_seconds=duration,
             worker_id=worker.worker_id,
-            error_message=f"Timed out after {config.timeout_seconds}s",
+            error_message=None if success else f"Timed out after {config.timeout_seconds}s",
             wte_count=wte_count,
             dump_file_count=dump_count,
         )
