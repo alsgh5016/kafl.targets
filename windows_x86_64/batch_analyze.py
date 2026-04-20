@@ -822,7 +822,7 @@ def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
     # no longer matches the current cleanup scope.
     try:
         result = subprocess.run(
-            ["pgrep", "-x", "qemu-system-x86_64"],
+            ["pgrep", "-f", "qemu-system-x86_64"],
             timeout=5, capture_output=True, text=True,
         )
         if result.returncode == 0 and result.stdout.strip():
