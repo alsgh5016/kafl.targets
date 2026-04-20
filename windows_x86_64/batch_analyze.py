@@ -529,7 +529,13 @@ def provision_sample(worker: WorkerInfo, sample_path: Path) -> None:
 
 
 def _halt_worker(worker: WorkerInfo) -> None:
-    """Halt worker VM: clean shutdown with forced fallback."""
+    """Halt worker VM: clean shutdown with forced fallback + process kill.
+
+    vagrant halt / virsh destroy sometimes leave the QEMU process alive,
+    which locks the disk image and causes subsequent QEMU-Nyx launches
+    to crash with 'Broken pipe'.  After VM-level halt, explicitly kill
+    any remaining libvirt QEMU process for this worker's disk image.
+    """
     try:
         result = subprocess.run(
             ["vagrant", "halt"],
@@ -537,6 +543,7 @@ def _halt_worker(worker: WorkerInfo) -> None:
             timeout=HALT_TIMEOUT,
         )
         if result.returncode == 0:
+            _ensure_vm_process_dead(worker)
             return
         logger.warning("[W%d] Clean halt failed, forcing", worker.worker_id)
     except subprocess.TimeoutExpired:
@@ -550,6 +557,25 @@ def _halt_worker(worker: WorkerInfo) -> None:
         )
     except Exception as e:
         logger.warning("[W%d] Forced halt failed: %s", worker.worker_id, e)
+
+    _ensure_vm_process_dead(worker)
+
+
+def _ensure_vm_process_dead(worker: WorkerInfo) -> None:
+    """Kill any QEMU process still using this worker's disk image.
+
+    After vagrant halt, the libvirt QEMU process sometimes survives.
+    It holds the qcow2 image open, blocking QEMU-Nyx from using it.
+    """
+    disk = str(worker.disk_image)
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", disk],
+            timeout=10, capture_output=True,
+        )
+    except Exception:
+        pass
+    time.sleep(1)
 
 
 def _force_vm_off(worker: WorkerInfo) -> None:
