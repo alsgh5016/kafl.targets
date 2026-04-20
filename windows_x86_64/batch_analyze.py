@@ -562,20 +562,57 @@ def _halt_worker(worker: WorkerInfo) -> None:
 
 
 def _ensure_vm_process_dead(worker: WorkerInfo) -> None:
-    """Kill any QEMU process still using this worker's disk image.
+    """Kill any QEMU process still using this worker's disk image
+    and verify it is actually gone before returning.
 
     After vagrant halt, the libvirt QEMU process sometimes survives.
     It holds the qcow2 image open, blocking QEMU-Nyx from using it.
+    Retries up to 5 times with escalating waits to confirm the
+    process is truly dead.
     """
     disk = str(worker.disk_image)
-    try:
-        subprocess.run(
-            ["pkill", "-9", "-f", disk],
-            timeout=10, capture_output=True,
-        )
-    except Exception:
-        pass
-    time.sleep(1)
+    max_attempts = 5
+
+    for attempt in range(1, max_attempts + 1):
+        # Kill anything using this disk image
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", disk],
+                timeout=10, capture_output=True,
+            )
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+        # Verify: check if any process still references this disk
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", disk],
+                timeout=5, capture_output=True, text=True,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                # No process found — confirmed dead
+                logger.debug(
+                    "[W%d] VM process confirmed dead (attempt %d)",
+                    worker.worker_id, attempt,
+                )
+                return
+            logger.warning(
+                "[W%d] VM process still alive after kill (attempt %d/%d): PIDs %s",
+                worker.worker_id, attempt, max_attempts,
+                result.stdout.strip().replace('\n', ', '),
+            )
+        except Exception:
+            return  # pgrep failed, assume dead
+
+        time.sleep(attempt)  # escalating wait: 1s, 2s, 3s, 4s, 5s
+
+    # Last resort: virsh destroy + force kill
+    logger.warning("[W%d] VM process survived %d kill attempts, virsh destroy",
+                   worker.worker_id, max_attempts)
+    _force_vm_off(worker)
+    time.sleep(2)
 
 
 def _force_vm_off(worker: WorkerInfo) -> None:
