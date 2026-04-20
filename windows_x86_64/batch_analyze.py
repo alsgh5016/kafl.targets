@@ -1143,9 +1143,11 @@ def run_batch(config: BatchConfig, workers: list[WorkerInfo]) -> list[SampleResu
         total, num_workers,
     )
 
-    # Launch worker threads
+    # Launch worker threads with staggered start to avoid
+    # concurrent snapshot restore / KVM init contention
+    WORKER_START_DELAY = 5  # seconds between each worker launch
     threads = []
-    for worker in active_workers:
+    for i, worker in enumerate(active_workers):
         t = threading.Thread(
             target=worker_loop,
             args=(worker, sample_q, config, results, results_lock, total, progress),
@@ -1154,6 +1156,9 @@ def run_batch(config: BatchConfig, workers: list[WorkerInfo]) -> list[SampleResu
         )
         threads.append(t)
         t.start()
+        if i < len(active_workers) - 1:
+            logger.info("Staggering worker start (%ds delay)...", WORKER_START_DELAY)
+            time.sleep(WORKER_START_DELAY)
 
     # Wait for completion
     for t in threads:
