@@ -661,10 +661,11 @@ def run_kafl(
         "--memory", str(qemu_memory),
     ]
 
-    # Per-worker monitor socket and VNC on unique port per worker
+    # Per-worker monitor socket. VNC disabled for production batches
+    # to avoid port conflicts on QEMU restart. Enable temporarily for
+    # debugging by changing '-vnc none' to '-vnc :{worker.worker_id}'.
     monitor_sock = workdir / "monitor.sock"
-    vnc_port = 5900 + worker.worker_id  # W0=:0 (5900), W1=:1 (5901), ...
-    qemu_extra = f"-monitor unix:{monitor_sock},server,nowait -vnc :{worker.worker_id}"
+    qemu_extra = f"-monitor unix:{monitor_sock},server,nowait -vnc none"
     cmd.append(f"--qemu-extra={qemu_extra}")
     cmd.extend(extra_args)
 
