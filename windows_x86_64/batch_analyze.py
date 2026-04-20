@@ -817,31 +817,15 @@ def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
         except Exception as exc:
             logger.debug("pkill KILL failed (non-critical): %s", exc)
 
-    # --- Global zombie sweep: kill ALL stray qemu-system-x86_64 ---
-    # Catches zombies from previous samples whose workdir pattern
-    # no longer matches the current cleanup scope.
+    # --- Global zombie sweep: kill ALL kAFL-spawned QEMU ---
+    # kAFL QEMUs always have '-fast_vm_reload' in their cmdline.
+    # Vagrant/libvirt QEMUs never do.  This is the safest filter.
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "qemu-system-x86_64"],
-            timeout=5, capture_output=True, text=True,
+        subprocess.run(
+            ["pkill", "-9", "-f", "fast_vm_reload"],
+            timeout=10, capture_output=True,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            stale_pids = result.stdout.strip().split('\n')
-            # Exclude the Vagrant/libvirt management QEMU (persistent worker VM)
-            for pid in stale_pids:
-                pid = pid.strip()
-                if not pid:
-                    continue
-                try:
-                    cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
-                        errors='replace')
-                    # Skip if this is a libvirt-managed VM (has 'libvirt' in args)
-                    if 'libvirt' in cmdline:
-                        continue
-                    logger.debug("Killing stale QEMU PID %s", pid)
-                    os.kill(int(pid), 9)
-                except (OSError, ValueError):
-                    pass
+        logger.debug("Global pkill -9 -f fast_vm_reload completed")
     except Exception as exc:
         logger.debug("Global zombie sweep failed (non-critical): %s", exc)
 
