@@ -782,18 +782,21 @@ def _safe_validate(workdir: Path) -> tuple[bool, int, Optional[int]]:
 
 
 def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
-    """Kill stray QEMU processes scoped to a workdir or worker disk image.
+    """Kill stray QEMU processes and reap zombies to prevent cascading failures.
 
-    Uses multiple patterns to catch QEMU processes that may have been spawned
-    with different argument orderings.  SIGTERM first for graceful exit, then
-    SIGKILL after a brief grace period.
+    Zombie QEMU processes hold /dev/kvm file descriptors and KVM kernel
+    resources.  When enough accumulate, new QEMU instances can't init KVM
+    and die with 'Broken pipe' at the Nyx handshake.  This function:
+      1. Kills QEMU matching this worker's disk image (scoped)
+      2. Kills ALL orphan qemu-system-x86_64 not in a known worker set (global)
+      3. Waits for zombie reaping
     """
+    # --- Scoped kill: this worker's QEMU ---
     patterns = [f"qemu-system-x86_64.*{re.escape(str(workdir))}"]
     if worker is not None:
         patterns.append(
             f"qemu-system-x86_64.*{re.escape(str(worker.disk_image))}"
         )
-    # First pass: SIGTERM for graceful shutdown
     for pattern in patterns:
         try:
             subprocess.run(
@@ -805,7 +808,6 @@ def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
 
     time.sleep(SIGTERM_GRACE)
 
-    # Second pass: SIGKILL for anything that survived
     for pattern in patterns:
         try:
             subprocess.run(
@@ -814,8 +816,37 @@ def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
             )
         except Exception as exc:
             logger.debug("pkill KILL failed (non-critical): %s", exc)
-    # Brief pause to let OS reclaim resources
-    time.sleep(1)
+
+    # --- Global zombie sweep: kill ALL stray qemu-system-x86_64 ---
+    # Catches zombies from previous samples whose workdir pattern
+    # no longer matches the current cleanup scope.
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "qemu-system-x86_64"],
+            timeout=5, capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            stale_pids = result.stdout.strip().split('\n')
+            # Exclude the Vagrant/libvirt management QEMU (persistent worker VM)
+            for pid in stale_pids:
+                pid = pid.strip()
+                if not pid:
+                    continue
+                try:
+                    cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(
+                        errors='replace')
+                    # Skip if this is a libvirt-managed VM (has 'libvirt' in args)
+                    if 'libvirt' in cmdline:
+                        continue
+                    logger.debug("Killing stale QEMU PID %s", pid)
+                    os.kill(int(pid), 9)
+                except (OSError, ValueError):
+                    pass
+    except Exception as exc:
+        logger.debug("Global zombie sweep failed (non-critical): %s", exc)
+
+    # Wait for kernel to reap killed processes and release KVM resources
+    time.sleep(2)
 
     # ── Aggressive residue cleanup for this workdir ─────────────────
     # When QEMU crashes mid-run it leaves shm segments, stale sockets,
