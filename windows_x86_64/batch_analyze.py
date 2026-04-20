@@ -608,8 +608,17 @@ def run_kafl(
     logger.info("[W%d] kafl: %s", worker.worker_id, " ".join(cmd))
     start = time.time()
 
+    # Pin each worker to dedicated physical cores to prevent Intel PT
+    # MSR contention.  Worker N uses cores [N*2, N*2+1] (2 cores each,
+    # matching the VM's vCPU count).  This ensures PT trace buffers and
+    # MSR state are never clobbered by another VM's context switch.
+    cores_per_worker = 2
+    cpu_start = worker.worker_id * cores_per_worker
+    cpu_end = cpu_start + cores_per_worker - 1
+    taskset_prefix = ["taskset", "-c", f"{cpu_start}-{cpu_end}"]
+
     proc = subprocess.Popen(
-        cmd, cwd=project_dir,
+        taskset_prefix + cmd, cwd=project_dir,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, start_new_session=True,
     )
