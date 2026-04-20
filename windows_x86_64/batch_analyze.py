@@ -598,9 +598,10 @@ def run_kafl(
         "--memory", str(qemu_memory),
     ]
 
-    # Per-worker monitor socket and VNC disabled to avoid conflicts
+    # Per-worker monitor socket and VNC on unique port per worker
     monitor_sock = workdir / "monitor.sock"
-    qemu_extra = f"-monitor unix:{monitor_sock},server,nowait -vnc none"
+    vnc_port = 5900 + worker.worker_id  # W0=:0 (5900), W1=:1 (5901), ...
+    qemu_extra = f"-monitor unix:{monitor_sock},server,nowait -vnc :{worker.worker_id}"
     cmd.append(f"--qemu-extra={qemu_extra}")
     cmd.extend(extra_args)
 
