@@ -716,6 +716,15 @@ def run_kafl(
             for line in stderr.strip().splitlines()[-20:]:
                 log_fn("  stderr: %s", line)
 
+    # Save QEMU stderr to workdir for post-mortem analysis.
+    # Contains nyx_printf output (WtE diagnostics, dirty ring stats).
+    if stderr:
+        qemu_log = workdir / "qemu_stderr.log"
+        try:
+            qemu_log.write_text(stderr)
+        except Exception:
+            pass
+
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
@@ -832,6 +841,7 @@ def collect_results(
     for name, is_dir in [
         ("hprintf_00.log", False),
         ("serial_00.log", False),
+        ("qemu_stderr.log", False),
         ("pt_trace_dump_0", False),
         ("dump", True),
         ("traces", True),
