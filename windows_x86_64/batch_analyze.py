@@ -969,10 +969,13 @@ def process_sample(
     sample_path: Path,
     worker: WorkerInfo,
     config: BatchConfig,
+    vagrant_lock: threading.Lock = None,
 ) -> SampleResult:
     """Process one PE sample on a specific worker.
 
     Pipeline: provision VM -> run kafl -> validate -> collect results.
+    Provision and halt are serialized via vagrant_lock to prevent
+    libvirt lock contention between concurrent workers.
     """
     sample_name = sample_path.stem.replace(" ", "_")
     start = time.time()
@@ -984,8 +987,13 @@ def process_sample(
         _cleanup_kafl(workdir, worker)
 
         # Phase 1: Provision worker VM with this sample
+        # Serialize vagrant operations to avoid libvirt lock conflicts
         logger.info("[W%d] Provisioning: %s", worker.worker_id, sample_name)
-        provision_sample(worker, sample_path)
+        if vagrant_lock:
+            with vagrant_lock:
+                provision_sample(worker, sample_path)
+        else:
+            provision_sample(worker, sample_path)
 
         # Phase 2: Run kAFL analysis
         logger.info("[W%d] Analyzing: %s", worker.worker_id, sample_name)
@@ -1064,21 +1072,32 @@ def process_sample(
     return result
 
 
+_vagrant_lock_ref: Optional[threading.Lock] = None
+
 def _recover_worker(worker: WorkerInfo) -> bool:
     """Restore worker VM to clean snapshot state after a failure.
 
     Returns True if recovery succeeded.
+    Uses the global vagrant_lock to serialize with provision operations.
     """
     logger.info("[W%d] Recovering worker (snapshot restore)...", worker.worker_id)
     _cleanup_kafl(Path("/nonexistent"), worker)
     _force_vm_off(worker)
-    try:
+
+    def _do_restore():
         _run_cmd(
             ["vagrant", "snapshot", "restore", "ready_provision"],
             cwd=worker.worker_dir, timeout=120,
             label=f"W{worker.worker_id} recovery restore",
         )
         _halt_worker(worker)
+
+    try:
+        if _vagrant_lock_ref:
+            with _vagrant_lock_ref:
+                _do_restore()
+        else:
+            _do_restore()
         logger.info("[W%d] Worker recovered", worker.worker_id)
         return True
     except Exception as exc:
@@ -1120,6 +1139,7 @@ def worker_loop(
     results_lock: threading.Lock,
     total: int,
     progress: BatchProgress,
+    vagrant_lock: threading.Lock = None,
 ) -> None:
     """Per-worker thread: dequeue and process samples sequentially."""
     consecutive_failures = 0
@@ -1132,7 +1152,7 @@ def worker_loop(
             break
 
         try:
-            result = process_sample(sample, worker, config)
+            result = process_sample(sample, worker, config, vagrant_lock)
 
             if result.status == SampleStatus.SUCCESS:
                 consecutive_failures = 0
@@ -1230,6 +1250,12 @@ def run_batch(config: BatchConfig, workers: list[WorkerInfo]) -> list[SampleResu
 
     results: list[SampleResult] = []
     results_lock = threading.Lock()
+    # Serialize vagrant operations (snapshot restore, provision, halt)
+    # to avoid libvirt lock contention between workers.
+    # Analysis (kafl fuzz) runs in parallel — only VM lifecycle is serialized.
+    global _vagrant_lock_ref
+    vagrant_lock = threading.Lock()
+    _vagrant_lock_ref = vagrant_lock
     progress = BatchProgress()
 
     # Add skipped results
@@ -1266,7 +1292,8 @@ def run_batch(config: BatchConfig, workers: list[WorkerInfo]) -> list[SampleResu
     for i, worker in enumerate(active_workers):
         t = threading.Thread(
             target=worker_loop,
-            args=(worker, sample_q, config, results, results_lock, total, progress),
+            args=(worker, sample_q, config, results, results_lock, total, progress,
+                  vagrant_lock),
             name=f"W{worker.worker_id}",
             daemon=True,
         )
