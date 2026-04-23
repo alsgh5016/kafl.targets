@@ -831,6 +831,7 @@ def collect_results(
 
     for name, is_dir in [
         ("hprintf_00.log", False),
+        ("serial_00.log", False),
         ("pt_trace_dump_0", False),
         ("dump", True),
         ("traces", True),
