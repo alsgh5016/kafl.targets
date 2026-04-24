@@ -699,6 +699,12 @@ def run_kafl(
             stdout, stderr = proc.communicate()
         # Kill any orphaned QEMU children that survived process group kill
         _cleanup_kafl(workdir, worker)
+        # Save stderr before raising (timeout path)
+        if stderr:
+            try:
+                (workdir / "qemu_stderr.log").write_text(stderr)
+            except Exception:
+                pass
         raise subprocess.TimeoutExpired(cmd, timeout, stdout, stderr)
 
     elapsed = time.time() - start
