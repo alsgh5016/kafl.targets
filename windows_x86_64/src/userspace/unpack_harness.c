@@ -1127,9 +1127,13 @@ int main(int argc, char** argv) {
     }
 
     if (g_target.image_base && g_target.size_of_image > 0) {
-        set_ip_range_usermode(g_target.image_base, g_target.size_of_image, 0);
-        g_submitted[0].base = g_target.image_base;
-        g_submitted[0].size = g_target.size_of_image;
+        /* Cover entire 32-bit user address space so PT captures
+         * execution in dynamically allocated regions (amber packer
+         * allocates at DLL-like addresses). DLL noise is filtered
+         * in the analysis layer via PEB module list. */
+        set_ip_range_usermode(0x10000, 0x7FFE0000 - 0x10000, 0);
+        g_submitted[0].base = 0x10000;
+        g_submitted[0].size = 0x7FFE0000 - 0x10000;
         g_submitted_count = 1;
 
         if (g_target.entry_point < g_target.image_base ||
