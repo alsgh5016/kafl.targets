@@ -55,6 +55,18 @@ HPRINTF_SUCCESS_MARKERS = [
     "Single execution complete",
 ]
 
+# Transient kafl/QEMU launch failures (Broken Pipe at Nyx handshake) often
+# succeed on retry after disk image lock release.  Marker substrings detected
+# in kafl stderr; threshold seconds below which an early exit is assumed
+# transient (Boot phase usually takes >30s once it actually starts).
+KAFL_TRANSIENT_LAUNCH_MARKERS = (
+    "Failed to connect to Qemu",
+    "Workers aborted before becoming ready",
+)
+KAFL_LAUNCH_MAX_ATTEMPTS = 2
+KAFL_EARLY_EXIT_THRESHOLD = 30
+KAFL_RETRY_BACKOFF = 5
+
 # Vagrantfile template for worker VMs.
 # Worker ID is derived from directory name (worker0 -> "0").
 # All Ruby #{} interpolations pass through Python unchanged.
@@ -639,6 +651,99 @@ def _force_vm_off(worker: WorkerInfo) -> None:
 # -- kAFL Execution --
 
 
+def _is_transient_launch_failure(
+    returncode: int, elapsed: float, stderr: str,
+) -> bool:
+    """True if kafl exited early with a Broken-Pipe-style marker.
+
+    These usually clear up after extra cleanup + a short wait — typically
+    a libvirt QEMU still holding the disk image, or a stale Nyx socket.
+    """
+    if returncode == 0:
+        return False
+    if elapsed >= KAFL_EARLY_EXIT_THRESHOLD:
+        return False
+    if not stderr:
+        return False
+    return any(m in stderr for m in KAFL_TRANSIENT_LAUNCH_MARKERS)
+
+
+def _ensure_disk_unlocked(worker: WorkerInfo) -> None:
+    """Pre-launch: kill any process still holding this worker's disk image.
+
+    Vagrant/libvirt sometimes leaves a stale QEMU after halt that locks
+    the qcow2 file.  When kafl-spawned QEMU then opens the same image,
+    the disk I/O conflict makes QEMU abort right after 'Booting VM to
+    start fuzzing...', producing a Broken Pipe on the Nyx socket.
+    """
+    disk = str(worker.disk_image)
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", disk],
+            timeout=5, capture_output=True, text=True,
+        )
+    except Exception:
+        return
+    pids = [p for p in result.stdout.split() if p.strip()]
+    if not pids:
+        return
+    logger.warning(
+        "[W%d] Pre-launch: %d process(es) still holding disk image (PIDs %s), killing",
+        worker.worker_id, len(pids), ",".join(pids),
+    )
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", disk],
+            timeout=5, capture_output=True,
+        )
+    except Exception:
+        pass
+    time.sleep(2)
+
+
+def _launch_kafl_once(
+    cmd: list[str],
+    taskset_prefix: list[str],
+    workdir: Path,
+    project_dir: Path,
+    worker: WorkerInfo,
+    timeout: int,
+) -> tuple[int, str, str, float]:
+    """Single kafl launch attempt.  Returns (rc, stdout, stderr, elapsed).
+
+    Raises subprocess.TimeoutExpired if the run exceeds `timeout` seconds.
+    """
+    logger.info("[W%d] kafl: %s", worker.worker_id, " ".join(cmd))
+    start = time.time()
+
+    proc = subprocess.Popen(
+        taskset_prefix + cmd, cwd=project_dir,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("[W%d] kafl timed out after %ds", worker.worker_id, timeout)
+        _kill_process_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        _cleanup_kafl(workdir, worker)
+        if stderr:
+            try:
+                (workdir / "qemu_stderr.log").write_text(stderr)
+            except Exception:
+                pass
+        raise subprocess.TimeoutExpired(cmd, timeout, stdout, stderr)
+
+    elapsed = time.time() - start
+    return proc.returncode, stdout, stderr, elapsed
+
+
 def run_kafl(
     workdir: Path,
     project_dir: Path,
@@ -647,7 +752,13 @@ def run_kafl(
     qemu_memory: int,
     extra_args: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
-    """Run kafl fuzz with a worker's disk image."""
+    """Run kafl fuzz with a worker's disk image.
+
+    Auto-retries on transient launch failures (Broken Pipe at Nyx
+    handshake) up to KAFL_LAUNCH_MAX_ATTEMPTS times.  Empirically these
+    failures are caused by libvirt's stale QEMU still locking the disk
+    image; one cleanup + retry recovers most cases.
+    """
     workdir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -669,9 +780,6 @@ def run_kafl(
     cmd.append(f"--qemu-extra={qemu_extra}")
     cmd.extend(extra_args)
 
-    logger.info("[W%d] kafl: %s", worker.worker_id, " ".join(cmd))
-    start = time.time()
-
     # Pin each worker to dedicated physical cores to prevent Intel PT
     # MSR contention.  Worker N uses cores [N*2, N*2+1] (2 cores each,
     # matching the VM's vCPU count).  This ensures PT trace buffers and
@@ -681,40 +789,38 @@ def run_kafl(
     cpu_end = cpu_start + cores_per_worker - 1
     taskset_prefix = ["taskset", "-c", f"{cpu_start}-{cpu_end}"]
 
-    proc = subprocess.Popen(
-        taskset_prefix + cmd, cwd=project_dir,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True,
-    )
+    rc = -1
+    stdout = ""
+    stderr = ""
+    elapsed = 0.0
 
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        logger.warning("[W%d] kafl timed out after %ds", worker.worker_id, timeout)
-        _kill_process_tree(proc)
-        try:
-            stdout, stderr = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        # Kill any orphaned QEMU children that survived process group kill
-        _cleanup_kafl(workdir, worker)
-        # Save stderr before raising (timeout path)
-        if stderr:
-            try:
-                (workdir / "qemu_stderr.log").write_text(stderr)
-            except Exception:
-                pass
-        raise subprocess.TimeoutExpired(cmd, timeout, stdout, stderr)
+    for attempt in range(1, KAFL_LAUNCH_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            logger.warning(
+                "[W%d] kafl retry %d/%d after transient launch failure",
+                worker.worker_id, attempt, KAFL_LAUNCH_MAX_ATTEMPTS,
+            )
+            _cleanup_kafl(workdir, worker)
+            time.sleep(KAFL_RETRY_BACKOFF)
 
-    elapsed = time.time() - start
+        _ensure_disk_unlocked(worker)
+
+        rc, stdout, stderr, elapsed = _launch_kafl_once(
+            cmd, taskset_prefix, workdir, project_dir, worker, timeout,
+        )
+
+        if not _is_transient_launch_failure(rc, elapsed, stderr):
+            break
+
+        logger.warning(
+            "[W%d] Transient launch failure (rc=%d, %.1fs), attempt %d/%d",
+            worker.worker_id, rc, elapsed, attempt, KAFL_LAUNCH_MAX_ATTEMPTS,
+        )
 
     # Log output on failure or suspiciously fast exit
-    if proc.returncode != 0 or elapsed < 30:
-        log_fn = logger.error if proc.returncode != 0 else logger.warning
-        log_fn(
-            "[W%d] kafl rc=%d (%.1fs)", worker.worker_id, proc.returncode, elapsed
-        )
+    if rc != 0 or elapsed < 30:
+        log_fn = logger.error if rc != 0 else logger.warning
+        log_fn("[W%d] kafl rc=%d (%.1fs)", worker.worker_id, rc, elapsed)
         if stdout:
             for line in stdout.strip().splitlines()[-20:]:
                 log_fn("  stdout: %s", line)
@@ -731,7 +837,7 @@ def run_kafl(
         except Exception:
             pass
 
-    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
