@@ -63,7 +63,7 @@ KAFL_TRANSIENT_LAUNCH_MARKERS = (
     "Failed to connect to Qemu",
     "Workers aborted before becoming ready",
 )
-KAFL_LAUNCH_MAX_ATTEMPTS = 2
+KAFL_LAUNCH_MAX_ATTEMPTS = 3
 KAFL_EARLY_EXIT_THRESHOLD = 30
 KAFL_RETRY_BACKOFF = 5
 
@@ -658,9 +658,11 @@ def _is_transient_launch_failure(
 
     These usually clear up after extra cleanup + a short wait — typically
     a libvirt QEMU still holding the disk image, or a stale Nyx socket.
+
+    Note: kafl returns rc=0 even when the worker aborted before becoming
+    ready (Manager exits cleanly).  rc is therefore unreliable; use the
+    elapsed+marker combination instead.
     """
-    if returncode == 0:
-        return False
     if elapsed >= KAFL_EARLY_EXIT_THRESHOLD:
         return False
     if not stderr:
@@ -996,15 +998,23 @@ def _safe_validate(workdir: Path) -> tuple[bool, int, Optional[int]]:
     return False, 0, None
 
 
-def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
+def _cleanup_kafl(
+    workdir: Path,
+    worker: Optional[WorkerInfo] = None,
+    *,
+    parallel_safe: bool = True,
+) -> None:
     """Kill stray QEMU processes and reap zombies to prevent cascading failures.
 
     Zombie QEMU processes hold /dev/kvm file descriptors and KVM kernel
     resources.  When enough accumulate, new QEMU instances can't init KVM
-    and die with 'Broken pipe' at the Nyx handshake.  This function:
-      1. Kills QEMU matching this worker's disk image (scoped)
-      2. Kills ALL orphan qemu-system-x86_64 not in a known worker set (global)
-      3. Waits for zombie reaping
+    and die with 'Broken pipe' at the Nyx handshake.
+
+    parallel_safe=True (default): only kills this worker's QEMU + cleans
+        per-workdir residue.  Safe to call while sibling workers run.
+    parallel_safe=False: also runs global 'pkill -9 -f fast_vm_reload'
+        which sweeps zombies but ALSO kills sibling workers' running
+        QEMUs.  Only safe when no other workers are active.
     """
     # --- Scoped kill: this worker's QEMU ---
     patterns = [f"qemu-system-x86_64.*{re.escape(str(workdir))}"]
@@ -1032,17 +1042,21 @@ def _cleanup_kafl(workdir: Path, worker: Optional[WorkerInfo] = None) -> None:
         except Exception as exc:
             logger.debug("pkill KILL failed (non-critical): %s", exc)
 
-    # --- Global zombie sweep: kill ALL kAFL-spawned QEMU ---
-    # kAFL QEMUs always have '-fast_vm_reload' in their cmdline.
-    # Vagrant/libvirt QEMUs never do.  This is the safest filter.
-    try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "fast_vm_reload"],
-            timeout=10, capture_output=True,
-        )
-        logger.debug("Global pkill -9 -f fast_vm_reload completed")
-    except Exception as exc:
-        logger.debug("Global zombie sweep failed (non-critical): %s", exc)
+    if not parallel_safe:
+        # --- Global zombie sweep: kill ALL kAFL-spawned QEMU ---
+        # kAFL QEMUs always have '-fast_vm_reload' in their cmdline.
+        # Vagrant/libvirt QEMUs never do.  This is the safest filter.
+        # NOTE: this nukes sibling workers' running QEMUs too, so only
+        # use when no parallel workers are active (teardown / single-
+        # worker batch / explicit recovery from total stall).
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", "fast_vm_reload"],
+                timeout=10, capture_output=True,
+            )
+            logger.debug("Global pkill -9 -f fast_vm_reload completed")
+        except Exception as exc:
+            logger.debug("Global zombie sweep failed (non-critical): %s", exc)
 
     # Wait for kernel to reap killed processes and release KVM resources
     time.sleep(2)
