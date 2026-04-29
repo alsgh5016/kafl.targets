@@ -123,6 +123,31 @@ def _signal_handler(_sig, _frame):
     _shutdown.set()
 
 
+# -- Active worker registry (for sibling-safe orphan sweep) --
+#
+# Each run_kafl() registers its workdir for the duration of the launch.
+# Smart sweeps then kill kafl QEMUs whose cmdline references NO active
+# workdir, leaving sibling workers' running QEMUs untouched.
+
+_active_workdirs: set[str] = set()
+_active_workdirs_lock = threading.Lock()
+
+
+def _register_active_workdir(workdir: Path) -> None:
+    with _active_workdirs_lock:
+        _active_workdirs.add(str(workdir))
+
+
+def _unregister_active_workdir(workdir: Path) -> None:
+    with _active_workdirs_lock:
+        _active_workdirs.discard(str(workdir))
+
+
+def _get_active_workdirs() -> set[str]:
+    with _active_workdirs_lock:
+        return set(_active_workdirs)
+
+
 # -- Enums & Dataclasses --
 
 
@@ -703,6 +728,80 @@ def _ensure_disk_unlocked(worker: WorkerInfo) -> None:
     time.sleep(2)
 
 
+def _sweep_orphan_kafl_qemus(active_workdirs: set[str]) -> int:
+    """Kill kafl QEMUs whose cmdline does not reference any active workdir.
+
+    Replaces the previous global 'pkill -9 -f fast_vm_reload' that nuked
+    sibling workers.  Walks /proc to inspect each candidate cmdline and
+    spares processes that belong to a currently-running run_kafl().
+
+    Returns the number of orphan PIDs killed.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "fast_vm_reload"],
+            timeout=5, capture_output=True, text=True,
+        )
+    except Exception:
+        return 0
+
+    killed = 0
+    for pid_str in result.stdout.split():
+        try:
+            pid = int(pid_str.strip())
+        except ValueError:
+            continue
+        try:
+            cmdline_bytes = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError):
+            continue
+        cmdline = cmdline_bytes.replace(b"\0", b" ").decode(
+            "utf-8", errors="replace"
+        )
+        if any(wd in cmdline for wd in active_workdirs):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            logger.debug("Cannot kill orphan PID %d (permission)", pid)
+    return killed
+
+
+def _log_qemu_state(worker_id: int) -> None:
+    """Diagnostic snapshot of QEMU/KVM state when retries persistently fail.
+
+    D-state processes cannot be killed by SIGKILL — they are stuck in an
+    uninterruptible kernel call (typically a KVM ioctl).  When this shows
+    up, no userspace fix can recover the host until the kernel resolves it.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,ppid,state,cmd"],
+            timeout=5, capture_output=True, text=True,
+        )
+    except Exception:
+        return
+    qemu_lines = [
+        ln for ln in result.stdout.splitlines()
+        if "qemu" in ln.lower() or "fast_vm_reload" in ln
+    ]
+    if not qemu_lines:
+        return
+    logger.warning("[W%d] QEMU process snapshot (%d entries):",
+                   worker_id, len(qemu_lines))
+    for ln in qemu_lines[:30]:
+        logger.warning("  %s", ln[:200])
+    d_state = [ln for ln in qemu_lines if " D " in ln[:40]]
+    if d_state:
+        logger.error(
+            "[W%d] %d QEMU(s) in D-state (uninterruptible kernel call); "
+            "host needs intervention", worker_id, len(d_state),
+        )
+
+
 def _launch_kafl_once(
     cmd: list[str],
     taskset_prefix: list[str],
@@ -796,28 +895,51 @@ def run_kafl(
     stderr = ""
     elapsed = 0.0
 
-    for attempt in range(1, KAFL_LAUNCH_MAX_ATTEMPTS + 1):
-        if attempt > 1:
-            logger.warning(
-                "[W%d] kafl retry %d/%d after transient launch failure",
-                worker.worker_id, attempt, KAFL_LAUNCH_MAX_ATTEMPTS,
+    _register_active_workdir(workdir)
+    try:
+        for attempt in range(1, KAFL_LAUNCH_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                logger.warning(
+                    "[W%d] kafl retry %d/%d after transient launch failure",
+                    worker.worker_id, attempt, KAFL_LAUNCH_MAX_ATTEMPTS,
+                )
+                # Sweep cross-sample / cross-worker orphan QEMUs (kafl's
+                # own zombie detector cannot reach them).  Active workers
+                # are protected by the workdir registry.
+                active = _get_active_workdirs()
+                killed = _sweep_orphan_kafl_qemus(active)
+                if killed:
+                    logger.warning(
+                        "[W%d] Swept %d orphan kafl QEMU(s) before retry",
+                        worker.worker_id, killed,
+                    )
+                _cleanup_kafl(workdir, worker, parallel_safe=True)
+                time.sleep(KAFL_RETRY_BACKOFF)
+
+            _ensure_disk_unlocked(worker)
+
+            rc, stdout, stderr, elapsed = _launch_kafl_once(
+                cmd, taskset_prefix, workdir, project_dir, worker, timeout,
             )
-            _cleanup_kafl(workdir, worker)
-            time.sleep(KAFL_RETRY_BACKOFF)
 
-        _ensure_disk_unlocked(worker)
+            if not _is_transient_launch_failure(rc, elapsed, stderr):
+                break
 
-        rc, stdout, stderr, elapsed = _launch_kafl_once(
-            cmd, taskset_prefix, workdir, project_dir, worker, timeout,
-        )
+            logger.warning(
+                "[W%d] Transient launch failure (rc=%d, %.1fs), attempt %d/%d",
+                worker.worker_id, rc, elapsed, attempt, KAFL_LAUNCH_MAX_ATTEMPTS,
+            )
 
-        if not _is_transient_launch_failure(rc, elapsed, stderr):
-            break
-
-        logger.warning(
-            "[W%d] Transient launch failure (rc=%d, %.1fs), attempt %d/%d",
-            worker.worker_id, rc, elapsed, attempt, KAFL_LAUNCH_MAX_ATTEMPTS,
-        )
+        # If all retries exhausted and still transient, dump diagnostic state
+        if _is_transient_launch_failure(rc, elapsed, stderr):
+            logger.error(
+                "[W%d] All %d launch attempts failed transiently; "
+                "dumping host state for analysis",
+                worker.worker_id, KAFL_LAUNCH_MAX_ATTEMPTS,
+            )
+            _log_qemu_state(worker.worker_id)
+    finally:
+        _unregister_active_workdir(workdir)
 
     # Log output on failure or suspiciously fast exit
     if rc != 0 or elapsed < 30:
