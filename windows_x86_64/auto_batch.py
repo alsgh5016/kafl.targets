@@ -22,6 +22,26 @@ import sys
 import time
 from pathlib import Path
 
+# Must match batch_analyze.py EXIT_CODE_HOST_DEGRADED.
+EXIT_CODE_HOST_DEGRADED = 2
+
+# KVM/libvirt recovery sequence (run as root).  Triggered when batch_analyze
+# exits with EXIT_CODE_HOST_DEGRADED — typically after ~5-10 successful
+# samples when KVM module state accumulates and new QEMU launches abort
+# right after 'Booting VM to start fuzzing...' (Broken Pipe at handshake).
+HOST_RECOVERY_SEQUENCE = [
+    (["systemctl", "stop", "libvirtd"], "stop libvirtd"),
+    (["pkill", "-9", "-f", "qemu-system-x86_64"], "kill stragglers"),
+    (["sleep", "2"], "settle"),
+    (["modprobe", "-r", "kvm_intel"], "unload kvm_intel"),
+    (["modprobe", "-r", "kvm"], "unload kvm"),
+    (["sleep", "1"], "settle"),
+    (["modprobe", "kvm"], "load kvm"),
+    (["modprobe", "kvm_intel"], "load kvm_intel"),
+    (["systemctl", "start", "libvirtd"], "start libvirtd"),
+    (["sleep", "5"], "wait for libvirtd"),
+]
+
 
 def count_remaining_targets(targets_dir: Path) -> int:
     """Count .exe files remaining in targets directory."""
@@ -101,6 +121,42 @@ def setup_workers(num_workers: int, project_dir: Path) -> int:
     )
 
 
+def recover_host() -> bool:
+    """Run the KVM module reload + libvirtd restart sequence.
+
+    Triggered when batch_analyze exits with EXIT_CODE_HOST_DEGRADED.
+    Empirically required after 5-10 successful samples on the same host;
+    the per-VM resource accumulation that surfaces as Broken Pipe at the
+    Nyx handshake only clears with a module reload.
+
+    Returns True if every step completed without error.
+    """
+    print(f"\n{'#'*60}")
+    print(f"[auto_batch] HOST RECOVERY (KVM module reload)")
+    print(f"{'#'*60}")
+    for cmd, label in HOST_RECOVERY_SEQUENCE:
+        print(f"[auto_batch] recover: {label} -> $ {' '.join(cmd)}")
+        # `sleep` is best-effort; failures here are just timing.
+        if cmd[0] == "sleep":
+            try:
+                time.sleep(int(cmd[1]))
+            except Exception:
+                pass
+            continue
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            # pkill failures are expected when no matching process exists
+            if cmd[0] == "pkill":
+                continue
+            print(f"[auto_batch] recover: {label} FAILED rc={result.returncode}")
+            if result.stderr:
+                for line in result.stderr.strip().splitlines()[:5]:
+                    print(f"[auto_batch]   stderr: {line}")
+            return False
+    print(f"[auto_batch] HOST RECOVERY complete\n")
+    return True
+
+
 def auto_batch(args: argparse.Namespace) -> None:
     project_dir = Path(__file__).resolve().parent
     targets_dir = args.targets_dir.resolve()
@@ -157,7 +213,7 @@ def auto_batch(args: argparse.Namespace) -> None:
                     break
 
         # Run batch
-        run_batch_round(
+        round_rc = run_batch_round(
             targets_dir, results_dir,
             args.num_workers, args.timeout,
             args.workdir, args.extra_args,
@@ -166,6 +222,19 @@ def auto_batch(args: argparse.Namespace) -> None:
 
         # Cleanup: remove empty results, delete completed targets
         cleanup_results(results_dir, targets_dir, project_dir)
+
+        # Host degraded -> heavyweight recovery before next round.
+        # The recovery wipes libvirt's running QEMUs, so the next round
+        # must rebuild workers (need_setup=True is already true since
+        # round_num > 1, so this happens naturally).
+        if round_rc == EXIT_CODE_HOST_DEGRADED:
+            print(f"\n[auto_batch] batch_analyze signalled HOST DEGRADED")
+            if not recover_host():
+                print("[auto_batch] Host recovery failed, aborting")
+                break
+            # Force worker rebuild on next round (vagrant domains may be
+            # disrupted by the libvirtd restart).
+            time.sleep(3)
 
         # Check progress
         new_remaining = count_remaining_targets(targets_dir)

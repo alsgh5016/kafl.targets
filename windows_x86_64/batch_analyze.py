@@ -67,6 +67,14 @@ KAFL_LAUNCH_MAX_ATTEMPTS = 3
 KAFL_EARLY_EXIT_THRESHOLD = 30
 KAFL_RETRY_BACKOFF = 5
 
+# Circuit breaker: when N consecutive samples fail with transient launch
+# errors (Broken Pipe at Nyx handshake), the host has entered the
+# "degraded mode" observed empirically after 5-10 successful samples.
+# Continued retries are wasted; signal auto_batch to run heavyweight
+# host recovery (KVM module reload + libvirtd restart).
+HOST_DEGRADED_THRESHOLD = 5
+EXIT_CODE_HOST_DEGRADED = 2
+
 # Vagrantfile template for worker VMs.
 # Worker ID is derived from directory name (worker0 -> "0").
 # All Ruby #{} interpolations pass through Python unchanged.
@@ -146,6 +154,46 @@ def _unregister_active_workdir(workdir: Path) -> None:
 def _get_active_workdirs() -> set[str]:
     with _active_workdirs_lock:
         return set(_active_workdirs)
+
+
+# -- Host degraded-mode circuit breaker --
+
+_host_degraded = threading.Event()
+_consecutive_transient_failures = 0
+_transient_failure_lock = threading.Lock()
+
+
+def _record_transient_failure(worker_id: int) -> None:
+    """Increment the consecutive-failure counter; trip the breaker at
+    HOST_DEGRADED_THRESHOLD."""
+    global _consecutive_transient_failures
+    with _transient_failure_lock:
+        _consecutive_transient_failures += 1
+        count = _consecutive_transient_failures
+    logger.warning(
+        "[W%d] Consecutive transient failures: %d/%d",
+        worker_id, count, HOST_DEGRADED_THRESHOLD,
+    )
+    if count >= HOST_DEGRADED_THRESHOLD and not _host_degraded.is_set():
+        logger.error(
+            "Host appears degraded (%d consecutive transient launch "
+            "failures).  Signalling shutdown for auto_batch recovery.",
+            count,
+        )
+        _host_degraded.set()
+        _shutdown.set()
+
+
+def _record_sample_success() -> None:
+    """Reset the consecutive-failure counter on a real sample success."""
+    global _consecutive_transient_failures
+    with _transient_failure_lock:
+        if _consecutive_transient_failures > 0:
+            logger.info(
+                "Reset transient-failure counter (was %d) after success",
+                _consecutive_transient_failures,
+            )
+            _consecutive_transient_failures = 0
 
 
 # -- Enums & Dataclasses --
@@ -931,6 +979,7 @@ def run_kafl(
             )
 
         # If all retries exhausted and still transient, dump diagnostic state
+        # and feed the circuit breaker.
         if _is_transient_launch_failure(rc, elapsed, stderr):
             logger.error(
                 "[W%d] All %d launch attempts failed transiently; "
@@ -938,6 +987,7 @@ def run_kafl(
                 worker.worker_id, KAFL_LAUNCH_MAX_ATTEMPTS,
             )
             _log_qemu_state(worker.worker_id)
+            _record_transient_failure(worker.worker_id)
     finally:
         _unregister_active_workdir(workdir)
 
@@ -1416,6 +1466,7 @@ def worker_loop(
             if result.status == SampleStatus.SUCCESS:
                 consecutive_failures = 0
                 recovery_attempted = False
+                _record_sample_success()
             else:
                 consecutive_failures += 1
 
@@ -1795,6 +1846,13 @@ def cmd_run(args: argparse.Namespace) -> None:
         1 for r in results
         if r.status in (SampleStatus.ERROR, SampleStatus.TIMEOUT)
     )
+    if _host_degraded.is_set():
+        logger.error(
+            "Exiting with code %d (host degraded) so auto_batch can run "
+            "heavyweight recovery before the next round.",
+            EXIT_CODE_HOST_DEGRADED,
+        )
+        sys.exit(EXIT_CODE_HOST_DEGRADED)
     sys.exit(1 if failed > 0 else 0)
 
 
