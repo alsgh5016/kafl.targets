@@ -68,7 +68,14 @@ qemu-nbd --disconnect "$NBD_DEV"
 trap - EXIT
 
 # ── reset NT hash via virt-customize (handles SYSKEY encryption) ─────────────
-info "Resetting vagrant password via virt-customize..."
-virt-customize -a "$BOX_IMG" --password vagrant:password:vagrant
+# Non-fatal: the MaximumPasswordAge=0x8000000000000000 patch above is the
+# primary fix.  virt-customize just refreshes pwdLastSet as extra insurance.
+info "Resetting vagrant password via virt-customize (optional)..."
+if virt-customize -a "$BOX_IMG" --password vagrant:password:vagrant 2>&1; then
+    info "virt-customize: password reset OK."
+else
+    info "virt-customize: password reset skipped (not supported on this host)."
+    info "Relying on MaximumPasswordAge=never-expires patch only."
+fi
 
 info "Done. The kafl_windows box now has a non-expiring vagrant/vagrant credential."

@@ -143,8 +143,11 @@ def main():
 
     before = data[0x18:0x20].hex()
     # MaximumPasswordAge at offset 0x18 (8-byte negative FILETIME interval).
-    # Setting to 0 disables the expiry policy for all local accounts.
-    h.patch(v, 0x18, b'\x00' * 8)
+    # 0x8000000000000000 is the Windows sentinel for "password never expires"
+    # (MIN_LARGE_INTEGER used by the SAMR protocol for unlimited age).
+    # Do NOT use all-zeros: Windows interprets 0 as "0-second age" = always expired.
+    NEVER_EXPIRES = b'\x00\x00\x00\x00\x00\x00\x00\x80'  # 0x8000000000000000 LE
+    h.patch(v, 0x18, NEVER_EXPIRES)
     after  = h.get_data(account, 'F')[0][0x18:0x20].hex()
 
     print(f"  MaximumPasswordAge: {before} -> {after}")
