@@ -31,6 +31,15 @@
 #define EXTENDED_STARTUPINFO_PRESENT 0x00080000
 #endif
 
+/* CLR / .NET header constants (corhdr.h not in mingw) used to flag
+ * AnyCPU images whose PE magic disagrees with their runtime bitness. */
+#ifndef IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
+#define IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR 14
+#endif
+#define COMIMAGE_FLAGS_ILONLY         0x00000001
+#define COMIMAGE_FLAGS_32BITREQUIRED  0x00000002
+#define COMIMAGE_FLAGS_32BITPREFERRED 0x00020000
+
 /* Configuration */
 #define DEFAULT_TIMEOUT_MS      300000  /* 5 minutes — give packer time to unpack */
 #define MAX_DUMP_SIZE           (64 * 1024 * 1024)  /* 64MB max dump */
@@ -59,6 +68,7 @@ typedef struct {
     UINT64 entry_point;
     UINT64 original_entry_point;  /* OEP - detected during unpacking */
     UINT64 size_of_image;
+    BOOL   is_64bit;              /* authoritative runtime bitness (IsWow64Process2) */
     section_info_t sections[64];
     int section_count;
 } target_process_t;
@@ -614,29 +624,65 @@ BOOL parse_pe_headers(HANDLE hProcess, UINT64 base_addr) {
     DWORD entry_point_rva;
     WORD num_sections;
     PIMAGE_SECTION_HEADER section;
-    
+    DWORD com_rva = 0;   /* CLR header RVA (0 = not a .NET assembly) */
+
     if (pe_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
         /* 32-bit PE */
         hprintf("[+] Detected 32-bit PE\n");
         PIMAGE_NT_HEADERS32 nt32 = (PIMAGE_NT_HEADERS32)(header_buffer + dos_header->e_lfanew);
         if (nt32->Signature != IMAGE_NT_SIGNATURE) return FALSE;
-        
+
         entry_point_rva = nt32->OptionalHeader.AddressOfEntryPoint;
         num_sections = nt32->FileHeader.NumberOfSections;
-        section = (PIMAGE_SECTION_HEADER)((BYTE*)&nt32->OptionalHeader + 
+        section = (PIMAGE_SECTION_HEADER)((BYTE*)&nt32->OptionalHeader +
                    nt32->FileHeader.SizeOfOptionalHeader);
+        com_rva = nt32->OptionalHeader.DataDirectory[
+                      IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress;
     } else if (pe_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         /* 64-bit PE */
         hprintf("[+] Detected 64-bit PE\n");
         PIMAGE_NT_HEADERS64 nt64 = (PIMAGE_NT_HEADERS64)(header_buffer + dos_header->e_lfanew);
         if (nt64->Signature != IMAGE_NT_SIGNATURE) return FALSE;
-        
+
         entry_point_rva = nt64->OptionalHeader.AddressOfEntryPoint;
         num_sections = nt64->FileHeader.NumberOfSections;
         section = IMAGE_FIRST_SECTION(nt64);
+        com_rva = nt64->OptionalHeader.DataDirectory[
+                      IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress;
     } else {
         hprintf("[-] Unknown PE magic: 0x%x\n", pe_magic);
         return FALSE;
+    }
+
+    /* .NET / CLR diagnostic + bitness cross-check.
+     * g_target.is_64bit is already set authoritatively (IsWow64Process2).
+     * Here we only surface the on-disk view: PE magic and, for managed
+     * images, CorFlags — and warn when they disagree with the runtime mode
+     * (the classic .NET AnyCPU promotion case). */
+    {
+        BOOL pe_magic_is_64 = (pe_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+        if (com_rva != 0) {
+            DWORD cor_flags = 0;
+            BYTE  cor_hdr[32] = {0};
+            SIZE_T cb = 0;
+            if (ReadProcessMemory(hProcess, (LPCVOID)(base_addr + com_rva),
+                                  cor_hdr, sizeof(cor_hdr), &cb) && cb >= 20) {
+                cor_flags = *(DWORD*)(cor_hdr + 16);  /* IMAGE_COR20_HEADER.Flags */
+            }
+            hprintf("[+] .NET assembly (COR20 @ RVA 0x%x, flags=0x%x: "
+                    "ILONLY=%d 32BITREQUIRED=%d 32BITPREFERRED=%d)\n",
+                    com_rva, cor_flags,
+                    (cor_flags & COMIMAGE_FLAGS_ILONLY) != 0,
+                    (cor_flags & COMIMAGE_FLAGS_32BITREQUIRED) != 0,
+                    (cor_flags & COMIMAGE_FLAGS_32BITPREFERRED) != 0);
+        }
+        if (pe_magic_is_64 != g_target.is_64bit) {
+            hprintf("[!] Bitness mismatch: PE magic=%s but process runs as %s "
+                    "(%s) -> trusting runtime mode\n",
+                    pe_magic_is_64 ? "PE32+(64)" : "PE32(32)",
+                    g_target.is_64bit ? "64-bit" : "32-bit",
+                    com_rva ? ".NET AnyCPU promotion" : "unexpected");
+        }
     }
     
     g_target.image_base = base_addr;
@@ -929,6 +975,61 @@ void dump_pt_trace(void) {
 }
 
 /*
+ * Authoritative runtime bitness of the (possibly suspended) child process.
+ *
+ * Asks Windows directly via IsWow64Process2 instead of trusting the on-disk
+ * PE magic. This matters for .NET "AnyCPU" images: they carry an i386/PE32
+ * header but the loader promotes them to a 64-bit process when 32BITREQUIRED
+ * is clear, so PE-magic detection would misclassify them as 32-bit. WOW64
+ * status is fixed at process creation, so this is valid even while suspended.
+ *
+ * Guest is always x64 Windows, therefore a process that is NOT running under
+ * WOW64 is necessarily native 64-bit.
+ */
+static BOOL detect_process_is_64bit(HANDLE hProcess) {
+    typedef BOOL (WINAPI *IsWow64Process2_t)(HANDLE, USHORT*, USHORT*);
+    static IsWow64Process2_t pIsWow64Process2 = NULL;
+    static BOOL resolved = FALSE;
+
+    if (!resolved) {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        if (k32) {
+            pIsWow64Process2 =
+                (IsWow64Process2_t)GetProcAddress(k32, "IsWow64Process2");
+        }
+        resolved = TRUE;
+    }
+
+    if (pIsWow64Process2) {
+        USHORT procMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+        USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+        if (pIsWow64Process2(hProcess, &procMachine, &nativeMachine)) {
+            /* procMachine == I386    -> WOW64 (32-bit)
+             * procMachine == UNKNOWN -> not WOW64 -> native 64-bit */
+            BOOL is64 = (procMachine != IMAGE_FILE_MACHINE_I386);
+            hprintf("[+] IsWow64Process2: procMachine=0x%x nativeMachine=0x%x -> %s\n",
+                    procMachine, nativeMachine, is64 ? "64-bit" : "32-bit");
+            return is64;
+        }
+    }
+
+    /* Fallback: legacy IsWow64Process (always available). On an x64 guest,
+     * not-WOW64 == 64-bit. */
+    {
+        BOOL wow64 = FALSE;
+        if (IsWow64Process(hProcess, &wow64)) {
+            hprintf("[+] IsWow64Process (fallback): wow64=%d -> %s\n",
+                    wow64, wow64 ? "32-bit" : "64-bit");
+            return !wow64;
+        }
+    }
+
+    hprintf("[!] WOW64 query failed (0x%X); defaulting to 32-bit\n",
+            (unsigned int)GetLastError());
+    return FALSE;
+}
+
+/*
  * Main unpacking routine
  */
 int main(int argc, char** argv) {
@@ -1065,8 +1166,15 @@ int main(int argc, char** argv) {
     g_target.process = pi.hProcess;
     g_target.thread = pi.hThread;
     g_target.pid = pi.dwProcessId;
-    
+
     hprintf("[+] Process created: PID %d\n", g_target.pid);
+
+    /* Determine the target's ACTUAL runtime bitness before WTE_SETUP so the
+     * host walks the correct page tables and PT filters the right VA range.
+     * Authoritative (handles .NET AnyCPU promotion); PE magic is only logged. */
+    g_target.is_64bit = detect_process_is_64bit(pi.hProcess);
+    hprintf("[+] Target runtime bitness: %s\n",
+            g_target.is_64bit ? "64-bit" : "32-bit");
 
     /* Get process base address via PEB */
     PROCESS_BASIC_INFORMATION pbi;
@@ -1104,7 +1212,8 @@ int main(int argc, char** argv) {
         wte_setup.target_pid  = (uint64_t)g_target.pid;
         wte_setup.image_base  = g_target.image_base;
         wte_setup.image_size  = (uint64_t)g_target.size_of_image;
-        wte_setup.flags       = WTE_FLAG_32BIT | WTE_FLAG_EAGER_NX;
+        wte_setup.flags       = (g_target.is_64bit ? 0 : WTE_FLAG_32BIT)
+                                | WTE_FLAG_EAGER_NX;
 
         hprintf("[+] WTE_SETUP: PID=%d image_base=0x%llx size=0x%llx flags=0x%x\n",
                 g_target.pid,
@@ -1127,13 +1236,18 @@ int main(int argc, char** argv) {
     }
 
     if (g_target.image_base && g_target.size_of_image > 0) {
-        /* Cover entire 32-bit user address space so PT captures
-         * execution in dynamically allocated regions (amber packer
-         * allocates at DLL-like addresses). DLL noise is filtered
-         * in the analysis layer via PEB module list. */
-        set_ip_range_usermode(0x10000, 0x7FFE0000 - 0x10000, 0);
-        g_submitted[0].base = 0x10000;
-        g_submitted[0].size = 0x7FFE0000 - 0x10000;
+        /* Cover the entire user address space so PT captures execution in
+         * dynamically allocated regions (packers map code at DLL-like or
+         * relocated addresses). DLL noise is filtered in the analysis layer
+         * via the PEB module list. The PT address-filter MSRs hold full
+         * linear addresses, so a single large range is fine. */
+        UINT64 ip_lo = 0x10000ULL;
+        UINT64 ip_hi = g_target.is_64bit
+                           ? 0x00007FFFFFFF0000ULL   /* canonical lower half */
+                           : 0x7FFE0000ULL;           /* 32-bit user space */
+        set_ip_range_usermode(ip_lo, ip_hi - ip_lo, 0);
+        g_submitted[0].base = ip_lo;
+        g_submitted[0].size = ip_hi - ip_lo;
         g_submitted_count = 1;
 
         if (g_target.entry_point < g_target.image_base ||
