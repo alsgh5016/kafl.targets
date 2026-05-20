@@ -53,7 +53,8 @@ trap cleanup EXIT
 PART="${NBD_DEV}p1"
 mkdir -p "$MOUNT_PT"
 info "Mounting $PART -> $MOUNT_PT"
-mount "$PART" "$MOUNT_PT"
+# remove_hiberfile: clear hibernation/fast-startup flag that blocks NTFS write access
+mount -t ntfs-3g -o remove_hiberfile "$PART" "$MOUNT_PT"
 
 # ── patch SAM: disable MaximumPasswordAge ────────────────────────────────────
 info "Patching SAM..."
