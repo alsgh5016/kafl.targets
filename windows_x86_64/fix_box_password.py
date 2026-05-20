@@ -152,7 +152,10 @@ def fix_user_pwnoexp(h):
 
     The ACB lives in the fixed (non-encrypted) header of the V binary at
     either offset 0x38 (Windows Vista+) or 0x34 (XP/2003).  We detect the
-    right offset by scanning for the Normal Account flag (0x0010).
+    right offset by looking for the Normal Account flag (0x0010).
+
+    We also clear the lockout bit (0x0400), which Windows sets after too
+    many failed login attempts — a common side-effect of WinRM retries.
     """
     # Try the standard vagrant RID first (1000 = 0x3E8)
     rid_keys = ['000003E8']
@@ -166,36 +169,48 @@ def fix_user_pwnoexp(h):
     except KeyError:
         pass
 
+    print(f"  RIDs found: {rid_keys}")
+
     for rid in rid_keys:
         try:
             user_node = h.navigate(f'SAM\\Domains\\Account\\Users\\{rid}')
         except KeyError:
+            print(f"  [{rid}] subkey not found")
             continue
 
         try:
             data, v = h.get_data(user_node, 'V')
-        except (AssertionError, KeyError):
+        except (AssertionError, KeyError) as e:
+            print(f"  [{rid}] V value not found: {e}")
             continue
 
+        if len(data) < 0x3A:
+            print(f"  [{rid}] V value too short ({len(data)} bytes)")
+            continue
+
+        # Log the raw ACB candidates to aid future debugging
+        for dbg_off in [0x34, 0x38]:
+            print(f"  [{rid}] V[0x{dbg_off:02x}] = "
+                  f"0x{struct.unpack_from('<H', data, dbg_off)[0]:04x}")
+
         # ACB is an unencrypted WORD in the V header.
-        # Try both known positions; accept the one that contains the
-        # Normal Account flag (0x0010) with no reserved bits set.
+        # Accept any offset where the Normal Account flag (0x0010) is set.
+        # NOTE: Do NOT gate on high bits (0xFC00).  Windows sets the lockout
+        # bit (0x0400) after repeated failed WinRM auth attempts, which was
+        # causing this function to silently skip all users.
         for acb_off in [0x38, 0x34]:
-            if len(data) <= acb_off + 2:
-                continue
             acb = struct.unpack_from('<H', data, acb_off)[0]
-            if not (acb & 0x0010):          # Normal Account bit must be set
-                continue
-            if acb & 0xFC00:                # high reserved bits must be clear
+            if not (acb & 0x0010):          # must be a Normal Account
                 continue
 
-            if acb & 0x0200:
+            # Set PWNOEXP (0x0200); clear lockout (0x0400) while we're here.
+            new_acb = (acb | 0x0200) & ~0x0400
+            if new_acb == acb:
                 print(f"  [{rid}] PWNOEXP already set (ACB=0x{acb:04x})")
             else:
-                new_acb = acb | 0x0200
                 h.patch(v, acb_off, struct.pack('<H', new_acb))
                 print(f"  [{rid}] ACB: 0x{acb:04x} -> 0x{new_acb:04x}  "
-                      f"(PWNOEXP set at V[0x{acb_off:02x}])")
+                      f"(PWNOEXP set, lockout cleared at V[0x{acb_off:02x}])")
             return True
 
     print("  WARNING: could not locate ACB for any user — PWNOEXP not set")
