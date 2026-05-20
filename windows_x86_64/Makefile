@@ -46,3 +46,11 @@ teardown-workers:
 
 batch-status:
 	python3 batch_analyze.py status
+
+# -- Fix expired vagrant/vagrant credentials in the base box --
+# The Windows guest expires passwords after 42 days by default.
+# Run this whenever `vagrant up` fails with WinRM authentication errors.
+BOX_IMG ?= $(HOME)/.vagrant.d/boxes/kafl_windows/0/libvirt/box_0.img
+
+fix-box:
+	sudo bash $(CUR_DIR)/fix_box_password.sh $(BOX_IMG)
