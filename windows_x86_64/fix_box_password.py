@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 """
-Patch Windows SAM hive to disable MaximumPasswordAge (no external dependencies).
+Fix expired vagrant/vagrant credentials in the kafl_windows Vagrant box.
 
-The kafl_windows Vagrant box uses a Windows guest whose local account password
-expires after 42 days (Windows default policy).  This script sets
-MaximumPasswordAge to 0 (unlimited) in the offline SAM hive so that the
-vagrant/vagrant WinRM credentials work indefinitely.
+Root cause: Windows local account password expires after 42 days (default
+policy).  The authoritative per-user flag is PWNOEXP (bit 0x0200) in the
+Account Control Block (ACB) stored unencrypted in the user's SAM V value.
+MaxPasswordAge in the domain F value only applies to domain accounts, not
+local ones.
 
-Usage (called by fix_box_password.sh, not directly):
-    python3 fix_box_password.py <sam_path>
+This script:
+  1. Sets PWNOEXP on the vagrant user's ACB so the password never expires.
+  2. Also zeroes MaxPasswordAge in the domain F value (belt-and-suspenders).
+
+Usage: python3 fix_box_password.py <sam_path>
 """
 
 import struct
 import sys
 
 
+# ---------------------------------------------------------------------------
+# Minimal REGF hive parser (no external dependencies)
+# ---------------------------------------------------------------------------
+
 class RegHive:
-    BASE = 0x1000  # hive bins start offset
+    BASE = 0x1000  # hive bins start
 
     def __init__(self, path):
         with open(path, 'rb') as f:
@@ -26,7 +34,7 @@ class RegHive:
         self.root_off = struct.unpack_from('<i', self.buf, 0x24)[0]
 
     def _abs(self, off):
-        # Each cell is prefixed with a 4-byte size field; skip it.
+        # Each cell is prefixed with a 4-byte size; skip it.
         return self.BASE + off + 4
 
     def _nk(self, off):
@@ -49,8 +57,8 @@ class RegHive:
     def _children(self, node):
         if node['nsub'] == 0 or node['suboff'] < 0:
             return {}
-        la   = self._abs(node['suboff'])
-        sig  = bytes(self.buf[la:la+2])
+        la  = self._abs(node['suboff'])
+        sig = bytes(self.buf[la:la+2])
         result = {}
 
         def _add(base, step):
@@ -85,11 +93,11 @@ class RegHive:
         for part in path.upper().split('\\'):
             subs = self._children(node)
             if part not in subs:
-                raise KeyError(f"key '{part}' not found (available: {list(subs)})")
+                raise KeyError(f"'{part}' not found (available: {list(subs)})")
             node = subs[part]
         return node
 
-    def _get_value(self, node, name):
+    def _get_vinfo(self, node, name):
         if node['nval'] == 0 or node['valoff'] < 0:
             return None
         va = self._abs(node['valoff'])
@@ -115,17 +123,17 @@ class RegHive:
                 )
         return None
 
-    def _data_abs(self, v):
+    def _data_start(self, v):
         return v['vka'] + 8 if v['inline'] else self._abs(v['doff'])
 
     def get_data(self, node, name):
-        v = self._get_value(node, name)
+        v = self._get_vinfo(node, name)
         assert v is not None, f"value '{name}' not found"
-        a = self._data_abs(v)
+        a = self._data_start(v)
         return bytes(self.buf[a : a + v['dlen']]), v
 
     def patch(self, v, offset, data):
-        a = self._data_abs(v) + offset
+        a = self._data_start(v) + offset
         self.buf[a : a + len(data)] = data
 
     def save(self):
@@ -133,26 +141,105 @@ class RegHive:
             f.write(self.buf)
 
 
+# ---------------------------------------------------------------------------
+# Fix 1: set PWNOEXP flag in vagrant user's ACB (primary fix)
+# ---------------------------------------------------------------------------
+
+def fix_user_pwnoexp(h):
+    """
+    Set the PasswordNeverExpires (PWNOEXP = 0x0200) bit in the vagrant
+    user's Account Control Block stored in the SAM V value.
+
+    The ACB lives in the fixed (non-encrypted) header of the V binary at
+    either offset 0x38 (Windows Vista+) or 0x34 (XP/2003).  We detect the
+    right offset by scanning for the Normal Account flag (0x0010).
+    """
+    # Try the standard vagrant RID first (1000 = 0x3E8)
+    rid_keys = ['000003E8']
+
+    # Fallback: enumerate all user RIDs
+    try:
+        users_node = h.navigate('SAM\\Domains\\Account\\Users')
+        for name in h._children(users_node):
+            if name != 'NAMES' and name not in rid_keys:
+                rid_keys.append(name)
+    except KeyError:
+        pass
+
+    for rid in rid_keys:
+        try:
+            user_node = h.navigate(f'SAM\\Domains\\Account\\Users\\{rid}')
+        except KeyError:
+            continue
+
+        try:
+            data, v = h.get_data(user_node, 'V')
+        except (AssertionError, KeyError):
+            continue
+
+        # ACB is an unencrypted WORD in the V header.
+        # Try both known positions; accept the one that contains the
+        # Normal Account flag (0x0010) with no reserved bits set.
+        for acb_off in [0x38, 0x34]:
+            if len(data) <= acb_off + 2:
+                continue
+            acb = struct.unpack_from('<H', data, acb_off)[0]
+            if not (acb & 0x0010):          # Normal Account bit must be set
+                continue
+            if acb & 0xFC00:                # high reserved bits must be clear
+                continue
+
+            if acb & 0x0200:
+                print(f"  [{rid}] PWNOEXP already set (ACB=0x{acb:04x})")
+            else:
+                new_acb = acb | 0x0200
+                h.patch(v, acb_off, struct.pack('<H', new_acb))
+                print(f"  [{rid}] ACB: 0x{acb:04x} -> 0x{new_acb:04x}  "
+                      f"(PWNOEXP set at V[0x{acb_off:02x}])")
+            return True
+
+    print("  WARNING: could not locate ACB for any user — PWNOEXP not set")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: zero MaxPasswordAge in domain F (belt-and-suspenders)
+# ---------------------------------------------------------------------------
+
+def fix_domain_maxpwdage(h):
+    """
+    Zero the MaxPasswordAge field in SAM\\Domains\\Account\\F.
+    Offset 0x18 confirmed empirically (value = -42 days on a fresh box).
+    Setting to 0x8000000000000000 (MS-SAMR sentinel for 'no max age').
+    """
+    account = h.navigate('SAM\\Domains\\Account')
+    data, v  = h.get_data(account, 'F')
+
+    before = data[0x18:0x20].hex()
+    NEVER  = b'\x00\x00\x00\x00\x00\x00\x00\x80'  # 0x8000000000000000 LE
+    h.patch(v, 0x18, NEVER)
+    after  = h.get_data(account, 'F')[0][0x18:0x20].hex()
+    print(f"  MaxPasswordAge: {before} -> {after}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     sam_path = sys.argv[1] if len(sys.argv) > 1 else \
                '/mnt/win/Windows/System32/config/SAM'
 
-    h       = RegHive(sam_path)
-    account = h.navigate('SAM\\Domains\\Account')
-    data, v = h.get_data(account, 'F')
+    h = RegHive(sam_path)
 
-    before = data[0x18:0x20].hex()
-    # MaximumPasswordAge at offset 0x18 (8-byte negative FILETIME interval).
-    # 0x8000000000000000 is the Windows sentinel for "password never expires"
-    # (MIN_LARGE_INTEGER used by the SAMR protocol for unlimited age).
-    # Do NOT use all-zeros: Windows interprets 0 as "0-second age" = always expired.
-    NEVER_EXPIRES = b'\x00\x00\x00\x00\x00\x00\x00\x80'  # 0x8000000000000000 LE
-    h.patch(v, 0x18, NEVER_EXPIRES)
-    after  = h.get_data(account, 'F')[0][0x18:0x20].hex()
+    print("[1] Setting PWNOEXP flag on vagrant user...")
+    fix_user_pwnoexp(h)
 
-    print(f"  MaximumPasswordAge: {before} -> {after}")
+    print("[2] Zeroing domain MaxPasswordAge...")
+    fix_domain_maxpwdage(h)
+
     h.save()
-    print("  SAM patched OK.")
+    print("SAM patched OK.")
 
 
 if __name__ == '__main__':
