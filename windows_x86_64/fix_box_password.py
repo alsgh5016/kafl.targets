@@ -208,6 +208,9 @@ def fix_user_pwnoexp(h):
             val = struct.unpack_from('<H', data, off)[0]
             if (val & 0x0010) and not (val & 0x01C0) and val < 0x0800:
                 acb_candidates.append((off, val))
+        # Sort by value ascending: the true ACB (0x0010 for Normal Account) is the
+        # minimum possible value; false positives from triplet header data are larger.
+        acb_candidates.sort(key=lambda x: x[1])
         print(f"  [{rid}] ACB candidates: "
               f"{[(f'0x{o:03x}', f'0x{v_:04x}') for o, v_ in acb_candidates]}")
 
