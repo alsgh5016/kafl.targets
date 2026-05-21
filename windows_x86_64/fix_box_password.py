@@ -4,12 +4,12 @@ Fix expired vagrant/vagrant credentials in the kafl_windows Vagrant box.
 
 Root cause: Windows local account password expires after 42 days (default
 policy).  The authoritative per-user flag is PWNOEXP (bit 0x0200) in the
-Account Control Block (ACB) stored unencrypted in the user's SAM V value.
-MaxPasswordAge in the domain F value only applies to domain accounts, not
-local ones.
+Account Control Block (ACB) stored at offset 0x38 in the per-user F value
+(SAM\\Domains\\Account\\Users\\<RID>\\F).  The V value contains encrypted
+hash blobs and string data — the ACB is NOT in the V value.
 
 This script:
-  1. Sets PWNOEXP on the vagrant user's ACB so the password never expires.
+  1. Sets PWNOEXP in the ACB of the per-user F value (primary fix).
   2. Also zeroes MaxPasswordAge in the domain F value (belt-and-suspenders).
 
 Usage: python3 fix_box_password.py <sam_path>
@@ -142,25 +142,23 @@ class RegHive:
 
 
 # ---------------------------------------------------------------------------
-# Fix 1: set PWNOEXP flag in vagrant user's ACB (primary fix)
+# Fix 1: set PWNOEXP flag in the per-user F value ACB (primary fix)
 # ---------------------------------------------------------------------------
 
-def fix_user_pwnoexp(h):
+def fix_user_acb_f(h):
     """
-    Set the PasswordNeverExpires (PWNOEXP = 0x0200) bit in the vagrant
-    user's Account Control Block stored in the SAM V value.
+    Set PWNOEXP (0x0200) and clear lockout (0x0400) in the per-user F value.
 
-    The ACB lives in the fixed (non-encrypted) header of the V binary at
-    either offset 0x38 (Windows Vista+) or 0x34 (XP/2003).  We detect the
-    right offset by looking for the Normal Account flag (0x0010).
+    The user F value (SAM\\Domains\\Account\\Users\\<RID>\\F) is a fixed-length
+    binary that holds account metadata: logon timestamps, RID, and the ACB.
+    The ACB is a WORD at offset 0x38 (with 0x3A as fallback for some builds).
 
-    We also clear the lockout bit (0x0400), which Windows sets after too
-    many failed login attempts — a common side-effect of WinRM retries.
+    The V value contains encrypted hash blobs and variable-length string data.
+    The 0x0010 that appears in the V value is the NT-hash-blob length field
+    (tag=0x0002, rev=0x0002, len=0x0010) — NOT the ACB.
     """
-    # Try the standard vagrant RID first (1000 = 0x3E8)
-    rid_keys = ['000003E8']
+    rid_keys = ['000003E8']  # standard vagrant RID (1000 decimal)
 
-    # Fallback: enumerate all user RIDs
     try:
         users_node = h.navigate('SAM\\Domains\\Account\\Users')
         for name in h._children(users_node):
@@ -171,7 +169,6 @@ def fix_user_pwnoexp(h):
 
     print(f"  RIDs found: {rid_keys}")
 
-    acb_candidates_printed = False
     for rid in rid_keys:
         try:
             user_node = h.navigate(f'SAM\\Domains\\Account\\Users\\{rid}')
@@ -180,55 +177,43 @@ def fix_user_pwnoexp(h):
             continue
 
         try:
-            data, v = h.get_data(user_node, 'V')
+            data, fv = h.get_data(user_node, 'F')
         except (AssertionError, KeyError) as e:
-            print(f"  [{rid}] V value not found: {e}")
+            print(f"  [{rid}] F value not found: {e}")
             continue
 
-        if len(data) < 0x3A:
-            print(f"  [{rid}] V value too short ({len(data)} bytes)")
+        if len(data) < 0x40:
+            print(f"  [{rid}] F value too short ({len(data)} bytes)")
             continue
 
-        # Full hex dump of V value for the first user — helps locate ACB offset
-        if not acb_candidates_printed:
-            print(f"  [{rid}] V: {len(data)} bytes  "
-                  f"doff=0x{v['doff']:x}  inline={v['inline']}")
-            for row in range(0, len(data), 16):
-                chunk = data[row:row+16]
-                hex_str = ' '.join(f'{b:02x}' for b in chunk)
-                print(f"  [{rid}]   {row:03x}: {hex_str}")
+        print(f"  [{rid}] F: {len(data)} bytes")
+        for row in range(0, min(0x50, len(data)), 16):
+            chunk = data[row:row+16]
+            print(f"  [{rid}]   {row:03x}: {' '.join(f'{b:02x}' for b in chunk)}")
 
-        # Scan the ENTIRE V value for ACB candidates.
-        # Filter: bit 4 (Normal Account, 0x0010) must be set;
-        #         bits 6/7/8 (trust account: 0x01C0) must be clear;
-        #         value < 0x0800 to exclude large offset values in the
-        #         triplet descriptor header (which happen to share bit 4).
-        acb_candidates = []
-        for off in range(0, len(data) - 1, 2):
-            val = struct.unpack_from('<H', data, off)[0]
-            if (val & 0x0010) and not (val & 0x01C0) and val < 0x0800:
-                acb_candidates.append((off, val))
-        # Sort by value ascending: the true ACB (0x0010 for Normal Account) is the
-        # minimum possible value; false positives from triplet header data are larger.
-        acb_candidates.sort(key=lambda x: x[1])
-        print(f"  [{rid}] ACB candidates: "
-              f"{[(f'0x{o:03x}', f'0x{v_:04x}') for o, v_ in acb_candidates]}")
+        # ACB is at 0x38; fall back to 0x3A for older builds
+        acb_off = 0x38
+        acb = struct.unpack_from('<H', data, acb_off)[0]
+        if not (acb & 0x0010) or (acb & 0x01C0):
+            acb_off = 0x3A
+            acb = struct.unpack_from('<H', data, acb_off)[0]
 
-        acb_candidates_printed = True
+        print(f"  [{rid}] ACB at F[0x{acb_off:02x}] = 0x{acb:04x}")
 
-        for acb_off, acb in acb_candidates:
-            # Set PWNOEXP (0x0200); clear lockout (0x0400) while we're here.
-            new_acb = (acb | 0x0200) & ~0x0400
-            if new_acb == acb:
-                print(f"  [{rid}] PWNOEXP already set at V[0x{acb_off:02x}] "
-                      f"(ACB=0x{acb:04x})")
-            else:
-                h.patch(v, acb_off, struct.pack('<H', new_acb))
-                print(f"  [{rid}] ACB: 0x{acb:04x} -> 0x{new_acb:04x}  "
-                      f"(PWNOEXP set, lockout cleared at V[0x{acb_off:02x}])")
-            return True
+        if not (acb & 0x0010) or (acb & 0x01C0):
+            print(f"  [{rid}] Skipping — neither 0x38 nor 0x3A looks like a normal user ACB")
+            continue
 
-    print("  WARNING: could not locate ACB for any user — PWNOEXP not set")
+        new_acb = (acb | 0x0200) & ~0x0400
+        if new_acb == acb:
+            print(f"  [{rid}] PWNOEXP already set (ACB=0x{acb:04x})")
+        else:
+            h.patch(fv, acb_off, struct.pack('<H', new_acb))
+            print(f"  [{rid}] ACB: 0x{acb:04x} -> 0x{new_acb:04x}  "
+                  f"(PWNOEXP set, lockout cleared at F[0x{acb_off:02x}])")
+        return True
+
+    print("  WARNING: could not find a normal user account in F values")
     return False
 
 
@@ -262,8 +247,8 @@ def main():
 
     h = RegHive(sam_path)
 
-    print("[1] Setting PWNOEXP flag on vagrant user...")
-    fix_user_pwnoexp(h)
+    print("[1] Setting PWNOEXP flag in per-user F value ACB...")
+    fix_user_acb_f(h)
 
     print("[2] Zeroing domain MaxPasswordAge...")
     fix_domain_maxpwdage(h)
