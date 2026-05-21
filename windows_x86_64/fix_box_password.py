@@ -171,6 +171,7 @@ def fix_user_pwnoexp(h):
 
     print(f"  RIDs found: {rid_keys}")
 
+    acb_candidates_printed = False
     for rid in rid_keys:
         try:
             user_node = h.navigate(f'SAM\\Domains\\Account\\Users\\{rid}')
@@ -188,26 +189,29 @@ def fix_user_pwnoexp(h):
             print(f"  [{rid}] V value too short ({len(data)} bytes)")
             continue
 
-        # Hex dump first 0x60 bytes of V to diagnose layout issues
-        print(f"  [{rid}] V: {len(data)} bytes  "
-              f"doff=0x{v['doff']:x}  inline={v['inline']}")
-        for row in range(0, min(0x60, len(data)), 16):
-            chunk = data[row:row+16]
-            hex_str = ' '.join(f'{b:02x}' for b in chunk)
-            print(f"  [{rid}]   {row:02x}: {hex_str}")
+        # Full hex dump of V value for the first user — helps locate ACB offset
+        if not acb_candidates_printed:
+            print(f"  [{rid}] V: {len(data)} bytes  "
+                  f"doff=0x{v['doff']:x}  inline={v['inline']}")
+            for row in range(0, len(data), 16):
+                chunk = data[row:row+16]
+                hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                print(f"  [{rid}]   {row:03x}: {hex_str}")
 
-        # Scan all 2-byte-aligned positions in the first 0x80 bytes for
-        # a value that has the Normal Account flag (0x0010) set.
-        # We no longer hard-code 0x38/0x34 — the exact offset varies and
-        # we want to self-discover it.
+        # Scan the ENTIRE V value for ACB candidates.
+        # Filter: bit 4 (Normal Account, 0x0010) must be set;
+        #         bits 6/7/8 (trust account: 0x01C0) must be clear;
+        #         value < 0x0800 to exclude large offset values in the
+        #         triplet descriptor header (which happen to share bit 4).
         acb_candidates = []
-        scan_end = min(0x80, len(data) - 1)
-        for off in range(0, scan_end, 2):
+        for off in range(0, len(data) - 1, 2):
             val = struct.unpack_from('<H', data, off)[0]
-            if val & 0x0010:                # Normal Account bit set
+            if (val & 0x0010) and not (val & 0x01C0) and val < 0x0800:
                 acb_candidates.append((off, val))
-        print(f"  [{rid}] ACB candidates (bit 0x0010 set): "
-              f"{[(f'0x{o:02x}', f'0x{v_:04x}') for o, v_ in acb_candidates]}")
+        print(f"  [{rid}] ACB candidates: "
+              f"{[(f'0x{o:03x}', f'0x{v_:04x}') for o, v_ in acb_candidates]}")
+
+        acb_candidates_printed = True
 
         for acb_off, acb in acb_candidates:
             # Set PWNOEXP (0x0200); clear lockout (0x0400) while we're here.
