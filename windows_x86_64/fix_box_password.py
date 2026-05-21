@@ -142,6 +142,80 @@ class RegHive:
 
 
 # ---------------------------------------------------------------------------
+# Fix 0: repair V value corruption from earlier incorrect patches
+# ---------------------------------------------------------------------------
+
+def repair_v_corruption(h):
+    """
+    Repair V value corruption left by earlier incorrect ACB-scan patches.
+
+    Previous versions of this script scanned the V value for an ACB and
+    wrote PWNOEXP (0x0200) into whatever WORD they found, corrupting:
+
+      1. NT/LM hash blob length fields:
+         tag=0x0002, rev=0x0002, len=0x10 → len=0x210 (16→528)
+         This breaks NTLM authentication entirely.
+
+      2. Triplet header length fields in the first 0xCC bytes:
+         e.g. comment-length DWORD 0x00000018 → 0x00000218
+
+    Detection for (1): scan for tag/rev=0x0002/0x0002 blobs with len > 32.
+    Detection for (2): 4-byte-aligned DWORDs in [0, 0xCC) where byte[1]=0x02,
+                       bytes[2-3]=0x00, and byte[0] is a small non-zero value.
+    """
+    rid_keys = ['000003E8']
+    try:
+        users_node = h.navigate('SAM\\Domains\\Account\\Users')
+        for name in h._children(users_node):
+            if name != 'NAMES' and name not in rid_keys:
+                rid_keys.append(name)
+    except KeyError:
+        pass
+
+    any_repaired = False
+    for rid in rid_keys:
+        try:
+            user_node = h.navigate(f'SAM\\Domains\\Account\\Users\\{rid}')
+            data, vv = h.get_data(user_node, 'V')
+        except Exception:
+            continue
+
+        # Repair 1: hash blob lengths (scan full V value for tag+rev signature)
+        for off in range(0, len(data) - 7):
+            if bytes(data[off:off+4]) != b'\x02\x00\x02\x00':
+                continue
+            blob_len = struct.unpack_from('<I', data, off + 4)[0]
+            if blob_len <= 32:
+                continue
+            correct = blob_len & 0xFF
+            if correct not in (0, 16, 20, 24, 32):
+                print(f"  [{rid}] V hash blob at 0x{off:03x}: "
+                      f"unexpected len=0x{blob_len:x}, skipping")
+                continue
+            h.patch(vv, off + 4, struct.pack('<I', correct))
+            print(f"  [{rid}] V hash blob 0x{off:03x}: "
+                  f"len 0x{blob_len:x} -> 0x{correct:x} (repaired)")
+            any_repaired = True
+
+        # Repair 2: triplet header length fields (4-byte-aligned, first 0xCC bytes)
+        for off in range(0, min(0xCC, len(data) - 3), 4):
+            dword = struct.unpack_from('<I', data, off)[0]
+            b0 = dword & 0xFF
+            b1 = (dword >> 8) & 0xFF
+            b2 = (dword >> 16) & 0xFF
+            b3 = (dword >> 24) & 0xFF
+            if b1 == 0x02 and b2 == 0 and b3 == 0 and 0 < b0 <= 0x50:
+                h.patch(vv, off, struct.pack('<I', b0))
+                print(f"  [{rid}] V triplet 0x{off:03x}: "
+                      f"0x{dword:08x} -> 0x{b0:02x} (repaired)")
+                any_repaired = True
+
+    if not any_repaired:
+        print("  No V value corruption detected")
+    return any_repaired
+
+
+# ---------------------------------------------------------------------------
 # Fix 1: set PWNOEXP flag in the per-user F value ACB (primary fix)
 # ---------------------------------------------------------------------------
 
@@ -246,6 +320,9 @@ def main():
                '/mnt/win/Windows/System32/config/SAM'
 
     h = RegHive(sam_path)
+
+    print("[0] Repairing V value corruption from previous bad patches...")
+    repair_v_corruption(h)
 
     print("[1] Setting PWNOEXP flag in per-user F value ACB...")
     fix_user_acb_f(h)
