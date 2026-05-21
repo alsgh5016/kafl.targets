@@ -106,3 +106,6 @@
 
     - name: Enable Testsigning
       win_command: Bcdedit.exe -set TESTSIGNING ON
+
+    - name: Set password never expires for vagrant user
+      win_shell: Get-LocalUser -Name vagrant | Set-LocalUser -PasswordNeverExpires $true
