@@ -188,25 +188,33 @@ def fix_user_pwnoexp(h):
             print(f"  [{rid}] V value too short ({len(data)} bytes)")
             continue
 
-        # Log the raw ACB candidates to aid future debugging
-        for dbg_off in [0x34, 0x38]:
-            print(f"  [{rid}] V[0x{dbg_off:02x}] = "
-                  f"0x{struct.unpack_from('<H', data, dbg_off)[0]:04x}")
+        # Hex dump first 0x60 bytes of V to diagnose layout issues
+        print(f"  [{rid}] V: {len(data)} bytes  "
+              f"doff=0x{v['doff']:x}  inline={v['inline']}")
+        for row in range(0, min(0x60, len(data)), 16):
+            chunk = data[row:row+16]
+            hex_str = ' '.join(f'{b:02x}' for b in chunk)
+            print(f"  [{rid}]   {row:02x}: {hex_str}")
 
-        # ACB is an unencrypted WORD in the V header.
-        # Accept any offset where the Normal Account flag (0x0010) is set.
-        # NOTE: Do NOT gate on high bits (0xFC00).  Windows sets the lockout
-        # bit (0x0400) after repeated failed WinRM auth attempts, which was
-        # causing this function to silently skip all users.
-        for acb_off in [0x38, 0x34]:
-            acb = struct.unpack_from('<H', data, acb_off)[0]
-            if not (acb & 0x0010):          # must be a Normal Account
-                continue
+        # Scan all 2-byte-aligned positions in the first 0x80 bytes for
+        # a value that has the Normal Account flag (0x0010) set.
+        # We no longer hard-code 0x38/0x34 — the exact offset varies and
+        # we want to self-discover it.
+        acb_candidates = []
+        scan_end = min(0x80, len(data) - 1)
+        for off in range(0, scan_end, 2):
+            val = struct.unpack_from('<H', data, off)[0]
+            if val & 0x0010:                # Normal Account bit set
+                acb_candidates.append((off, val))
+        print(f"  [{rid}] ACB candidates (bit 0x0010 set): "
+              f"{[(f'0x{o:02x}', f'0x{v_:04x}') for o, v_ in acb_candidates]}")
 
+        for acb_off, acb in acb_candidates:
             # Set PWNOEXP (0x0200); clear lockout (0x0400) while we're here.
             new_acb = (acb | 0x0200) & ~0x0400
             if new_acb == acb:
-                print(f"  [{rid}] PWNOEXP already set (ACB=0x{acb:04x})")
+                print(f"  [{rid}] PWNOEXP already set at V[0x{acb_off:02x}] "
+                      f"(ACB=0x{acb:04x})")
             else:
                 h.patch(v, acb_off, struct.pack('<H', new_acb))
                 print(f"  [{rid}] ACB: 0x{acb:04x} -> 0x{new_acb:04x}  "
