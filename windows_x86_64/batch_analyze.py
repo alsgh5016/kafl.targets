@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import queue
+import random
 import re
 import shutil
 import signal
@@ -1467,6 +1468,10 @@ def worker_loop(
                 consecutive_failures = 0
                 recovery_attempted = False
                 _record_sample_success()
+            elif result.status == SampleStatus.TIMEOUT:
+                # Timeout means the worker ran fine; the sample just didn't
+                # complete within the time limit.  Don't penalise the worker.
+                consecutive_failures = 0
             else:
                 consecutive_failures += 1
 
@@ -1581,6 +1586,10 @@ def run_batch(config: BatchConfig, workers: list[WorkerInfo]) -> list[SampleResu
     if total == 0:
         logger.info("Nothing to process")
         return results
+
+    # Shuffle so that repeated rounds don't starve the same tail samples
+    # when workers stop early due to consecutive errors.
+    random.shuffle(pending)
 
     # Create sample queue
     sample_q: queue.Queue = queue.Queue()
