@@ -1030,6 +1030,112 @@ static BOOL detect_process_is_64bit(HANDLE hProcess) {
 }
 
 /*
+ * inject_jit_sweep — Force-JIT all .NET methods in the target process.
+ *
+ * Looks for sweep_helper.dll in the same directory as this harness executable,
+ * then injects it into the target via a remote LoadLibraryA thread.  The DLL's
+ * DllMain calls ICLRRuntimeHost::ExecuteInDefaultAppDomain to invoke
+ * SweepHelper.Sweeper.Sweep(""), which calls RuntimeHelpers.PrepareMethod on
+ * every non-system, non-generic method already loaded in the target AppDomain.
+ *
+ * This ensures that packed .NET code that has been JIT-compiled by the packer
+ * before our WtE window starts is still captured: PrepareMethod re-triggers
+ * the JIT (or validates the existing native stub), causing the written pages
+ * to be executed, which fires our WtE detection.
+ *
+ * The function is a best-effort operation — if sweep_helper.dll is absent, or
+ * if the target is not a .NET process, it logs the situation and returns
+ * without aborting the harness.
+ *
+ * @param hProcess  Handle to the target process (PROCESS_ALL_ACCESS).
+ * @param hThread   Handle to the target's main thread (currently unused, but
+ *                  passed for future suspension/resume coordination).
+ */
+static void inject_jit_sweep(HANDLE hProcess, HANDLE hThread) {
+    (void)hThread;  /* reserved for future use */
+
+    /* --- 1. Build path to sweep_helper.dll (same dir as harness) --- */
+    char sweep_dll_path[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, sweep_dll_path, MAX_PATH)) {
+        hprintf("[-] JIT sweep: GetModuleFileNameA failed (0x%X)\n",
+                (unsigned)GetLastError());
+        return;
+    }
+    char *last_sep = strrchr(sweep_dll_path, '\\');
+    if (last_sep) {
+        strcpy(last_sep + 1, "sweep_helper.dll");
+    } else {
+        strcpy(sweep_dll_path, "sweep_helper.dll");
+    }
+    hprintf("[+] JIT sweep: DLL path = %s\n", sweep_dll_path);
+
+    /* --- 2. Verify the DLL exists on disk --- */
+    if (GetFileAttributesA(sweep_dll_path) == INVALID_FILE_ATTRIBUTES) {
+        hprintf("[!] JIT sweep: sweep_helper.dll not found — skipping\n");
+        return;
+    }
+
+    /* --- 3. Allocate memory in target for the DLL path string --- */
+    SIZE_T path_len = strlen(sweep_dll_path) + 1;
+    LPVOID remote_path = VirtualAllocEx(hProcess, NULL, path_len,
+                                        MEM_COMMIT | MEM_RESERVE,
+                                        PAGE_READWRITE);
+    if (!remote_path) {
+        hprintf("[-] JIT sweep: VirtualAllocEx failed (0x%X)\n",
+                (unsigned)GetLastError());
+        return;
+    }
+
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(hProcess, remote_path,
+                            sweep_dll_path, path_len, &written)
+        || written != path_len) {
+        hprintf("[-] JIT sweep: WriteProcessMemory failed (0x%X)\n",
+                (unsigned)GetLastError());
+        VirtualFreeEx(hProcess, remote_path, 0, MEM_RELEASE);
+        return;
+    }
+
+    /* --- 4. Get LoadLibraryA address from this process (same across
+     *         all processes in a boot session on x64 Windows) --- */
+    LPTHREAD_START_ROUTINE load_lib =
+        (LPTHREAD_START_ROUTINE)GetProcAddress(
+            GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
+    if (!load_lib) {
+        hprintf("[-] JIT sweep: GetProcAddress(LoadLibraryA) failed (0x%X)\n",
+                (unsigned)GetLastError());
+        VirtualFreeEx(hProcess, remote_path, 0, MEM_RELEASE);
+        return;
+    }
+
+    /* --- 5. Create remote thread and wait up to 120 seconds --- */
+    HANDLE hSweep = CreateRemoteThread(hProcess, NULL, 0,
+                                       load_lib, remote_path,
+                                       0, NULL);
+    if (hSweep) {
+        hprintf("[+] JIT sweep: sweep_helper.dll injected, waiting (up to 120s)...\n");
+        DWORD rc = WaitForSingleObject(hSweep, 120000 /* ms */);
+        if (rc == WAIT_TIMEOUT) {
+            hprintf("[!] JIT sweep: timed out waiting for DLL load\n");
+        } else if (rc == WAIT_OBJECT_0) {
+            DWORD exit_code = 0;
+            GetExitCodeThread(hSweep, &exit_code);
+            hprintf("[+] JIT sweep: complete (LoadLibrary returned 0x%X)\n",
+                    (unsigned)exit_code);
+        } else {
+            hprintf("[-] JIT sweep: WaitForSingleObject error (0x%X)\n",
+                    (unsigned)GetLastError());
+        }
+        CloseHandle(hSweep);
+    } else {
+        hprintf("[-] JIT sweep: CreateRemoteThread failed (0x%X)\n",
+                (unsigned)GetLastError());
+    }
+
+    VirtualFreeEx(hProcess, remote_path, 0, MEM_RELEASE);
+}
+
+/*
  * Main unpacking routine
  */
 int main(int argc, char** argv) {
@@ -1292,6 +1398,16 @@ int main(int argc, char** argv) {
     DWORD start_tick = GetTickCount();
     DWORD poll_interval_ms = 1000;
     DWORD wait_result = WAIT_TIMEOUT;
+
+    /* JIT sweep trigger: fire once at 60% of the timeout window.
+     * This gives the packer 60% of the allotted time to initialise the CLR
+     * and load/unpack the managed assemblies, then the sweep gets the
+     * remaining 40% to JIT-compile everything before we stop tracing. */
+    BOOL  sweep_triggered = FALSE;
+    DWORD sweep_trigger_ms = (g_timeout_ms != 0)
+                             ? (DWORD)(g_timeout_ms * 0.6)
+                             : 0 /* disabled when timeout is infinite */;
+
     while (1) {
         wait_result = WaitForSingleObject(pi.hProcess, poll_interval_ms);
         if (wait_result == WAIT_OBJECT_0) {
@@ -1311,6 +1427,16 @@ int main(int argc, char** argv) {
 
         if (g_timeout_ms != 0) {
             DWORD elapsed = GetTickCount() - start_tick;
+
+            /* Fire the JIT sweep once at 60% of the timeout */
+            if (!sweep_triggered && sweep_trigger_ms > 0 &&
+                elapsed >= sweep_trigger_ms) {
+                sweep_triggered = TRUE;
+                hprintf("[+] Triggering JIT sweep at %lums (60%% of timeout)\n",
+                        (unsigned long)elapsed);
+                inject_jit_sweep(pi.hProcess, pi.hThread);
+            }
+
             if (elapsed >= g_timeout_ms) {
                 hprintf("[+] Timeout reached \xe2\x80\x94 suspending target\n");
                 SuspendThread(pi.hThread);
