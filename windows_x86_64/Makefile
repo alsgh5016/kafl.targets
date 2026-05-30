@@ -36,6 +36,9 @@ compile:
 		echo "    Windows guest with the .NET Framework compiler:" ; \
 		echo "      csc /platform:x86 /target:library /out:sweep_core.dll sweep_helper.cs" ; \
 	fi
+	# Ship the managed source alongside the binaries so provision can rebuild
+	# sweep_core.dll on the guest with the .NET Framework csc.
+	cp src/userspace/sweep_helper/sweep_helper.cs bin/userspace/sweep_helper.cs
 
 provision_userspace: compile ansible
 	vagrant snapshot restore 'ready_provision'
