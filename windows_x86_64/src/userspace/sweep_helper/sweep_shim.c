@@ -102,14 +102,32 @@ static const GUID kIID_ICLRRuntimeHost =
 
 static HINSTANCE g_self = NULL;
 
+/* Append a diagnostic line to C:\sweep_shim.log (the shim runs in the guest
+ * and has no hprintf channel).  Best-effort; ignored on failure. */
+static void shim_log(const char *fmt, DWORD a, DWORD b)
+{
+    char buf[160];
+    wsprintfA(buf, fmt, a, b);
+    HANDLE h = CreateFileA("C:\\sweep_shim.log", FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(h, 0, NULL, FILE_END);
+    DWORD w;
+    WriteFile(h, buf, lstrlenA(buf), &w, NULL);
+    CloseHandle(h);
+}
+
 /* Attach to the running CLR and invoke the managed sweep once. */
 static void run_sweep_once(void)
 {
+    shim_log("shim: thread start (self=0x%08x)\r\n", (DWORD)(UINT_PTR)g_self, 0);
+
     HMODULE mscoree = LoadLibraryW(L"mscoree.dll");
-    if (!mscoree) return;
+    if (!mscoree) { shim_log("shim: mscoree load FAIL\r\n", 0, 0); return; }
     CLRCreateInstance_t pCLRCreateInstance =
         (CLRCreateInstance_t)GetProcAddress(mscoree, "CLRCreateInstance");
-    if (!pCLRCreateInstance) return;
+    if (!pCLRCreateInstance) { shim_log("shim: no CLRCreateInstance\r\n", 0, 0); return; }
 
     ICLRMetaHost    *meta = NULL;
     ICLRRuntimeInfo *info = NULL;
@@ -118,16 +136,22 @@ static void run_sweep_once(void)
 
     hr = pCLRCreateInstance(&kCLSID_CLRMetaHost, &kIID_ICLRMetaHost,
                             (LPVOID *)&meta);
+    shim_log("shim: CLRCreateInstance hr=0x%08x meta=0x%08x\r\n",
+             (DWORD)hr, (DWORD)(UINT_PTR)meta);
     if (FAILED(hr) || !meta) return;
 
     hr = meta->lpVtbl->GetRuntime(meta, CLR_VERSION,
                                   &kIID_ICLRRuntimeInfo, (void **)&info);
+    shim_log("shim: GetRuntime hr=0x%08x info=0x%08x\r\n",
+             (DWORD)hr, (DWORD)(UINT_PTR)info);
     if (FAILED(hr) || !info) goto out_meta;
 
     /* The target already started the CLR; GetInterface hands us the live
      * host without re-initialising it. */
     hr = info->lpVtbl->GetInterface(info, &kCLSID_CLRRuntimeHost,
                                     &kIID_ICLRRuntimeHost, (void **)&host);
+    shim_log("shim: GetInterface hr=0x%08x host=0x%08x\r\n",
+             (DWORD)hr, (DWORD)(UINT_PTR)host);
     if (FAILED(hr) || !host) goto out_info;
 
     /* Build <dir-of-this-shim>\sweep_core.dll. */
@@ -141,8 +165,10 @@ static void run_sweep_once(void)
               MAX_PATH - lstrlenW(core_path));
 
     DWORD ret = 0;
-    host->lpVtbl->ExecuteInDefaultAppDomain(host, core_path,
+    hr = host->lpVtbl->ExecuteInDefaultAppDomain(host, core_path,
         SWEEP_NAMESPACE, SWEEP_METHOD, L"", &ret);
+    shim_log("shim: ExecuteInDefaultAppDomain hr=0x%08x ret=%u\r\n",
+             (DWORD)hr, (DWORD)ret);
 
 out_host:
     host->lpVtbl->Release(host);
@@ -150,6 +176,7 @@ out_info:
     info->lpVtbl->Release(info);
 out_meta:
     meta->lpVtbl->Release(meta);
+    shim_log("shim: done\r\n", 0, 0);
 }
 
 static DWORD WINAPI sweep_thread(LPVOID param)

@@ -21,7 +21,7 @@ compile:
 	# Force-JIT sweep: native CLR-hosting shim, 32-bit to match the target
 	# process it is injected into (must be i686, NOT x86_64).
 	i686-w64-mingw32-gcc -shared -O2 -o bin/userspace/sweep_helper.dll \
-		src/userspace/sweep_helper/sweep_shim.c -Wall
+		src/userspace/sweep_helper/sweep_shim.c -luser32 -Wall
 	# Force-JIT sweep: managed core (PrepareMethod over all methods).
 	# Prefer mono's mcs on the build host; if absent, build sweep_core.dll
 	# on the Windows guest with csc /platform:x86 /target:library.
