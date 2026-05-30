@@ -27,6 +27,24 @@
 
     - name: Setup unpack harness target
       block:
+        # Build the force-JIT sweep managed core with the guest's own .NET
+        # Framework compiler.  The host build uses mono (mcs), whose output
+        # can be incompatible with the target's .NET Framework CLR; rebuilding
+        # with csc here overrides bin/userspace/sweep_core.dll so the shim's
+        # ExecuteInDefaultAppDomain loads a native-compatible assembly.
+        - name: Upload sweep_helper managed source
+          win_copy:
+            src: src/userspace/sweep_helper/sweep_helper.cs
+            dest: "{{ dest_path }}\\bin\\userspace\\sweep_helper.cs"
+
+        - name: Build sweep_core.dll with .NET Framework csc (overrides mono build)
+          win_command: >-
+            C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe
+            /nologo /platform:x86 /target:library
+            /out:sweep_core.dll sweep_helper.cs
+          args:
+            chdir: "{{ dest_path }}\\bin\\userspace"
+
         - name: Setup unpack harness to run at user login
           win_shortcut:
             src: "{{ ansible_env.USERPROFILE }}\\Desktop\\bin\\userspace\\unpack_harness.exe"
