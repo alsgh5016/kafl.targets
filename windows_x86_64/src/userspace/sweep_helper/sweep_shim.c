@@ -29,6 +29,11 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+/* kAFL hprintf hypercall — routes shim diagnostics to the host's
+ * hprintf_00.log.  A guest-side C:\ file cannot be retrieved by the harness,
+ * but hprintf goes over VMCALL to the same aux buffer QEMU writes to disk.
+ * nyx_api.h provides hprintf() / kAFL_hypercall() (32- and 64-bit). */
+#include "nyx_api.h"
 
 /* ── Minimal metahost / CLR-host COM definitions ──────────────────────
  * Only the vtable slots we actually call are typed; everything before them
@@ -102,32 +107,16 @@ static const GUID kIID_ICLRRuntimeHost =
 
 static HINSTANCE g_self = NULL;
 
-/* Append a diagnostic line to C:\sweep_shim.log (the shim runs in the guest
- * and has no hprintf channel).  Best-effort; ignored on failure. */
-static void shim_log(const char *fmt, DWORD a, DWORD b)
-{
-    char buf[160];
-    wsprintfA(buf, fmt, a, b);
-    HANDLE h = CreateFileA("C:\\sweep_shim.log", FILE_APPEND_DATA,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    SetFilePointer(h, 0, NULL, FILE_END);
-    DWORD w;
-    WriteFile(h, buf, lstrlenA(buf), &w, NULL);
-    CloseHandle(h);
-}
-
 /* Attach to the running CLR and invoke the managed sweep once. */
 static void run_sweep_once(void)
 {
-    shim_log("shim: thread start (self=0x%08x)\r\n", (DWORD)(UINT_PTR)g_self, 0);
+    hprintf("[SHIM] thread start (self=0x%08x)\n", (unsigned)(UINT_PTR)g_self);
 
     HMODULE mscoree = LoadLibraryW(L"mscoree.dll");
-    if (!mscoree) { shim_log("shim: mscoree load FAIL\r\n", 0, 0); return; }
+    if (!mscoree) { hprintf("[SHIM] mscoree load FAIL\n"); return; }
     CLRCreateInstance_t pCLRCreateInstance =
         (CLRCreateInstance_t)GetProcAddress(mscoree, "CLRCreateInstance");
-    if (!pCLRCreateInstance) { shim_log("shim: no CLRCreateInstance\r\n", 0, 0); return; }
+    if (!pCLRCreateInstance) { hprintf("[SHIM] no CLRCreateInstance\n"); return; }
 
     ICLRMetaHost    *meta = NULL;
     ICLRRuntimeInfo *info = NULL;
@@ -136,22 +125,22 @@ static void run_sweep_once(void)
 
     hr = pCLRCreateInstance(&kCLSID_CLRMetaHost, &kIID_ICLRMetaHost,
                             (LPVOID *)&meta);
-    shim_log("shim: CLRCreateInstance hr=0x%08x meta=0x%08x\r\n",
-             (DWORD)hr, (DWORD)(UINT_PTR)meta);
+    hprintf("[SHIM] CLRCreateInstance hr=0x%08x meta=0x%08x\n",
+            (unsigned)hr, (unsigned)(UINT_PTR)meta);
     if (FAILED(hr) || !meta) return;
 
     hr = meta->lpVtbl->GetRuntime(meta, CLR_VERSION,
                                   &kIID_ICLRRuntimeInfo, (void **)&info);
-    shim_log("shim: GetRuntime hr=0x%08x info=0x%08x\r\n",
-             (DWORD)hr, (DWORD)(UINT_PTR)info);
+    hprintf("[SHIM] GetRuntime hr=0x%08x info=0x%08x\n",
+            (unsigned)hr, (unsigned)(UINT_PTR)info);
     if (FAILED(hr) || !info) goto out_meta;
 
     /* The target already started the CLR; GetInterface hands us the live
      * host without re-initialising it. */
     hr = info->lpVtbl->GetInterface(info, &kCLSID_CLRRuntimeHost,
                                     &kIID_ICLRRuntimeHost, (void **)&host);
-    shim_log("shim: GetInterface hr=0x%08x host=0x%08x\r\n",
-             (DWORD)hr, (DWORD)(UINT_PTR)host);
+    hprintf("[SHIM] GetInterface hr=0x%08x host=0x%08x\n",
+            (unsigned)hr, (unsigned)(UINT_PTR)host);
     if (FAILED(hr) || !host) goto out_info;
 
     /* Build <dir-of-this-shim>\sweep_core.dll. */
@@ -167,8 +156,8 @@ static void run_sweep_once(void)
     DWORD ret = 0;
     hr = host->lpVtbl->ExecuteInDefaultAppDomain(host, core_path,
         SWEEP_NAMESPACE, SWEEP_METHOD, L"", &ret);
-    shim_log("shim: ExecuteInDefaultAppDomain hr=0x%08x ret=%u\r\n",
-             (DWORD)hr, (DWORD)ret);
+    hprintf("[SHIM] ExecuteInDefaultAppDomain hr=0x%08x ret=%u\n",
+            (unsigned)hr, (unsigned)ret);
 
 out_host:
     host->lpVtbl->Release(host);
@@ -176,7 +165,7 @@ out_info:
     info->lpVtbl->Release(info);
 out_meta:
     meta->lpVtbl->Release(meta);
-    shim_log("shim: done\r\n", 0, 0);
+    hprintf("[SHIM] done\n");
 }
 
 static DWORD WINAPI sweep_thread(LPVOID param)
