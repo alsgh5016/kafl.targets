@@ -26,12 +26,15 @@ compile:
 	# Prefer mono's mcs on the build host; if absent, build sweep_core.dll
 	# on the Windows guest with csc /platform:x86 /target:library.
 	if command -v mcs >/dev/null 2>&1; then \
-		mcs -target:library -platform:x86 \
+		mcs -sdk:4 -target:library -platform:x86 \
 			-out:bin/userspace/sweep_core.dll \
 			src/userspace/sweep_helper/sweep_helper.cs ; \
 	else \
-		echo "[!] mcs not found — build sweep_core.dll on the Windows guest:" ; \
-		echo "    csc /platform:x86 /target:library /out:sweep_core.dll sweep_helper.cs" ; \
+		echo "[!] mcs not found. Install mono on the build host:" ; \
+		echo "      apt-get install -y mono-mcs    # or mono-devel" ; \
+		echo "    then re-run 'make compile'. Alternatively build on the" ; \
+		echo "    Windows guest with the .NET Framework compiler:" ; \
+		echo "      csc /platform:x86 /target:library /out:sweep_core.dll sweep_helper.cs" ; \
 	fi
 
 provision_userspace: compile ansible
