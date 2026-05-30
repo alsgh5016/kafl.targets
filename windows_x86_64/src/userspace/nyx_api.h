@@ -202,6 +202,10 @@ typedef struct {
 	uint64_t image_base;        /* Target PE image base VA */
 	uint64_t image_size;        /* Target PE SizeOfImage */
 	uint32_t flags;             /* WTE_FLAG_32BIT | WTE_FLAG_EAGER_NX */
+	uint64_t sweep_flag_gva;    /* Harness VA of the force-JIT sweep signal
+	                             * flag (uint32).  QEMU writes the idle-window
+	                             * counter here when the JIT goes quiet; the
+	                             * harness polls it to run the sweep.  0 = off. */
 } __attribute__((packed)) kafl_wte_setup_t;
 
 #define MAX_API_HOOKS 16

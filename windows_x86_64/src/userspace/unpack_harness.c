@@ -77,6 +77,12 @@ typedef struct {
 static target_process_t g_target = {0};
 static int g_dump_mode = DUMP_MODE_EXECUTABLE;
 static DWORD g_timeout_ms = DEFAULT_TIMEOUT_MS;
+
+/* Force-JIT sweep signal flag.  QEMU (wte_sweep_trigger_check) writes the
+ * idle-window counter here over the harness CR3 when the JIT goes quiet;
+ * the main wait loop polls it to run the sweep on the live process.
+ * Aligned + volatile: written by the hypervisor, read by our poll loop. */
+static volatile uint32_t g_sweep_window __attribute__((aligned(8))) = 0;
 static char g_output_prefix[MAX_PATH] = "unpacked";
 static char g_target_args[MAX_PATH] = "";  /* Arguments to pass to target process */
 static char g_target_basename[MAX_PATH] = "target";  /* Target filename without extension */
@@ -1320,12 +1326,17 @@ int main(int argc, char** argv) {
         wte_setup.image_size  = (uint64_t)g_target.size_of_image;
         wte_setup.flags       = (g_target.is_64bit ? 0 : WTE_FLAG_32BIT)
                                 | WTE_FLAG_EAGER_NX;
+        /* Hand QEMU the VA of our sweep-signal flag so it can poke us when
+         * the JIT goes idle (force-JIT sweep trigger). */
+        wte_setup.sweep_flag_gva = (uint64_t)(uintptr_t)&g_sweep_window;
 
-        hprintf("[+] WTE_SETUP: PID=%d image_base=0x%llx size=0x%llx flags=0x%x\n",
+        hprintf("[+] WTE_SETUP: PID=%d image_base=0x%llx size=0x%llx flags=0x%x "
+                "sweep_flag_gva=0x%llx\n",
                 g_target.pid,
                 (unsigned long long)wte_setup.image_base,
                 (unsigned long long)wte_setup.image_size,
-                wte_setup.flags);
+                wte_setup.flags,
+                (unsigned long long)wte_setup.sweep_flag_gva);
 
         uint64_t child_cr3 = kAFL_hypercall(HYPERCALL_KAFL_WTE_SETUP,
                                              (UINT64)&wte_setup);
@@ -1407,6 +1418,7 @@ int main(int argc, char** argv) {
     DWORD sweep_trigger_ms = (g_timeout_ms != 0)
                              ? (DWORD)(g_timeout_ms * 0.6)
                              : 0 /* disabled when timeout is infinite */;
+    uint32_t last_sweep_window = 0;  /* last idle-window value seen from QEMU */
 
     while (1) {
         wait_result = WaitForSingleObject(pi.hProcess, poll_interval_ms);
@@ -1415,6 +1427,21 @@ int main(int argc, char** argv) {
             GetExitCodeProcess(pi.hProcess, &exit_code);
             hprintf("[!] Process exited (code %d)\n", exit_code);
             break;
+        }
+
+        /* Force-JIT sweep trigger: QEMU writes the JIT-idle window counter
+         * into g_sweep_window when the JIT goes quiet.  Prefer this over the
+         * 60%% timer — it fires right when loading has stabilised. */
+        uint32_t win = g_sweep_window;
+        if (win != last_sweep_window) {
+            hprintf("[+] Sweep signal: JIT idle window %u (prev %u)\n",
+                    win, last_sweep_window);
+            last_sweep_window = win;
+            if (!sweep_triggered) {
+                sweep_triggered = TRUE;
+                hprintf("[+] Triggering JIT sweep (idle-driven, window %u)\n", win);
+                inject_jit_sweep(pi.hProcess, pi.hThread);
+            }
         }
         /* NOTE: Dynamic IP range update disabled mid-fuzz.
          * HYPERCALL_KAFL_RANGE_SUBMIT is blocked after ACQUIRE by
