@@ -1456,8 +1456,11 @@ int main(int argc, char** argv) {
             last_sweep_window = win;
             if (!sweep_triggered) {
                 sweep_triggered = TRUE;
-                hprintf("[+] Triggering JIT sweep (idle-driven, window %u)\n", win);
-                inject_jit_sweep(pi.hProcess, pi.hThread);
+                /* CONTROL RUN: force-JIT sweep disabled to isolate whether the
+                 * crash comes from our sweep or the protection itself. */
+                hprintf("[+] JIT sweep DISABLED (control run) — idle window %u\n", win);
+                /* hprintf("[+] Triggering JIT sweep (idle-driven, window %u)\n", win);
+                   inject_jit_sweep(pi.hProcess, pi.hThread); */
             }
         }
         /* NOTE: Dynamic IP range update disabled mid-fuzz.
@@ -1476,9 +1479,12 @@ int main(int argc, char** argv) {
             if (!sweep_triggered && sweep_trigger_ms > 0 &&
                 elapsed >= sweep_trigger_ms) {
                 sweep_triggered = TRUE;
-                hprintf("[+] Triggering JIT sweep at %lums (60%% of timeout)\n",
+                /* CONTROL RUN: force-JIT sweep disabled (see idle-driven path). */
+                hprintf("[+] JIT sweep DISABLED (control run) — %lums elapsed\n",
                         (unsigned long)elapsed);
-                inject_jit_sweep(pi.hProcess, pi.hThread);
+                /* hprintf("[+] Triggering JIT sweep at %lums (60%% of timeout)\n",
+                           (unsigned long)elapsed);
+                   inject_jit_sweep(pi.hProcess, pi.hThread); */
             }
 
             if (elapsed >= g_timeout_ms) {
