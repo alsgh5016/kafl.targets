@@ -29,46 +29,25 @@ namespace SweepHelper
     public static class Sweeper
     {
         /// <summary>
-        /// Enumerate all non-system assemblies already loaded in the default
-        /// AppDomain and call RuntimeHelpers.PrepareMethod on every concrete,
-        /// non-generic method found. This forces the JIT to compile each
-        /// method body so that WtE detection sees all unpacked .NET code as
-        /// executed (and therefore committed) memory.
+        /// PASS 1 — run every target module's static constructor
+        /// (<c>&lt;Module&gt;.cctor</c>) so ConfuserEx's runtime IL-decryption /
+        /// JIT hook is installed BEFORE any force-JIT.  Force-JITing a method
+        /// before that init runs makes the JIT compile still-encrypted IL,
+        /// faulting with a native access violation (0xC0000005).  Running the
+        /// module cctor first ensures bodies are decrypted / the hook is
+        /// installed.  <c>RunModuleConstructor</c> is idempotent — a no-op if
+        /// the cctor already ran.
         ///
-        /// Returns the total number of methods successfully JIT-compiled.
-        /// Errors (abstract methods, generic instantiations, etc.) are swallowed
-        /// so that one bad method never aborts the sweep.
+        /// Split out as its own ICLRRuntimeHost entry point (called before
+        /// <see cref="SweepForceJit"/>) so the native shim can wrap each pass in
+        /// its own fault-containment guard and localise where a crash occurs.
         /// </summary>
         /// <param name="_arg">Unused; required by ICLRRuntimeHost API.</param>
-        /// <returns>Count of successfully prepared methods (ignored by harness).</returns>
-        public static int Sweep(string _arg)
+        /// <returns>Count of module constructors run.</returns>
+        public static int SweepCctors(string _arg)
         {
             int count = 0;
-
-            // Collect the target application's own assemblies (skip dynamic
-            // and framework/GAC assemblies).  We force-JIT only these.
-            var targetAsms = new List<Assembly>();
-            foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                // Dynamic assemblies have no on-disk IL to prepare.
-                if (asm.IsDynamic)
-                    continue;
-                if (IsSystemAssembly(asm))
-                    continue;
-                targetAsms.Add(asm);
-            }
-
-            // PASS 1 — run every module's static constructor (<Module>.cctor)
-            // BEFORE any force-JIT.  ConfuserEx (anti-tamper / constant /
-            // anti-ildump and the shared runtime init) installs its IL-
-            // decryption / JIT hook in the module initializer.  Force-JITing a
-            // method before that init has run makes the JIT compile still-
-            // encrypted IL, faulting with an UNCATCHABLE native access
-            // violation (0xC0000005) that kills the entire process.  Running
-            // the module cctor first ensures bodies are decrypted / the hook is
-            // installed.  RunModuleConstructor is idempotent — a no-op if the
-            // cctor already ran.
-            foreach (Assembly asm in targetAsms)
+            foreach (Assembly asm in CollectTargetAssemblies())
             {
                 Module[] modules;
                 try
@@ -87,18 +66,34 @@ namespace SweepHelper
                     try
                     {
                         RuntimeHelpers.RunModuleConstructor(mod.ModuleHandle);
+                        count++;
                     }
                     catch
                     {
                         // A throwing decryptor cctor is non-fatal; other
-                        // modules and the force-JIT pass below may still run.
+                        // modules and the force-JIT pass still run.
                     }
                 }
             }
+            return count;
+        }
 
-            // PASS 2 — force-JIT every concrete, non-generic method/ctor so WtE
-            // detection sees all unpacked .NET code as executed memory.
-            foreach (Assembly asm in targetAsms)
+        /// <summary>
+        /// PASS 2 — call <c>RuntimeHelpers.PrepareMethod</c> on every concrete,
+        /// non-generic method/ctor of the target's own assemblies, forcing the
+        /// JIT to compile bodies that were never called so the hypervisor's
+        /// compileMethod tap captures their decrypted IL.  Run AFTER
+        /// <see cref="SweepCctors"/> so method bodies are already decrypted.
+        ///
+        /// Errors (abstract methods, generic instantiations, P/Invoke stubs)
+        /// are swallowed so one bad method never aborts the sweep.
+        /// </summary>
+        /// <param name="_arg">Unused; required by ICLRRuntimeHost API.</param>
+        /// <returns>Count of successfully prepared methods.</returns>
+        public static int SweepForceJit(string _arg)
+        {
+            int count = 0;
+            foreach (Assembly asm in CollectTargetAssemblies())
             {
                 // GetTypes() can throw ReflectionTypeLoadException when some
                 // types fail to load (e.g. missing dependencies).  Recover
@@ -187,6 +182,27 @@ namespace SweepHelper
             }
 
             return count;
+        }
+
+        /// <summary>
+        /// The target application's own assemblies currently loaded in the
+        /// default AppDomain — dynamic and framework/GAC assemblies excluded.
+        /// Re-enumerated per pass (cheap, idempotent) so each ICLR entry point
+        /// is self-contained.
+        /// </summary>
+        private static List<Assembly> CollectTargetAssemblies()
+        {
+            var targetAsms = new List<Assembly>();
+            foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                // Dynamic assemblies have no on-disk IL to prepare.
+                if (asm.IsDynamic)
+                    continue;
+                if (IsSystemAssembly(asm))
+                    continue;
+                targetAsms.Add(asm);
+            }
+            return targetAsms;
         }
 
         /// <summary>

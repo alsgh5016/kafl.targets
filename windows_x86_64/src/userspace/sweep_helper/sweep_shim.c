@@ -5,14 +5,18 @@
  * remote LoadLibraryA thread.  A pure managed DLL cannot be driven by
  * LoadLibrary (no native DllMain), so this native shim bridges the gap:
  * on load it spins a worker thread that attaches to the target's
- * already-running CLR and invokes the managed entry point
+ * already-running CLR and invokes two managed entry points in sequence
  *
- *     SweepHelper.Sweeper.Sweep(string)   in  sweep_core.dll
+ *     SweepHelper.Sweeper.SweepCctors(string)     in  sweep_core.dll
+ *     SweepHelper.Sweeper.SweepForceJit(string)
  *
- * in the default AppDomain.  That managed method calls
+ * in the default AppDomain.  SweepCctors runs each module's <Module>.cctor
+ * (installing ConfuserEx's decryptor / JIT hook); SweepForceJit then calls
  * RuntimeHelpers.PrepareMethod on every non-system method (incl. ctors),
  * forcing the JIT to compile method bodies that were never called — so the
- * hypervisor's compileMethod tap captures their decrypted IL.
+ * hypervisor's compileMethod tap captures their decrypted IL.  Each pass runs
+ * under a Vectored-Exception-Handler guard so a hard fault is contained
+ * instead of killing the target (see "Fault containment" below).
  *
  * The CLR work runs on a fresh thread (NOT in DllMain) to avoid the loader
  * lock.  mscohost APIs are resolved dynamically from mscoree.dll (already
@@ -29,6 +33,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <setjmp.h>   /* fault containment: MinGW gcc has no __try/__except */
 /* kAFL hprintf hypercall — routes shim diagnostics to the host's
  * hprintf_00.log.  A guest-side C:\ file cannot be retrieved by the harness,
  * but hprintf goes over VMCALL to the same aux buffer QEMU writes to disk.
@@ -119,12 +124,74 @@ static const GUID kCLSID_CLRRuntimeHost =
 static const GUID kIID_ICLRRuntimeHost =
     {0x90F1A06C,0x7712,0x4762,{0x86,0xB5,0x7A,0x5E,0xBA,0x6B,0xDB,0x02}};
 
-#define SWEEP_CORE_DLL   L"sweep_core.dll"
-#define SWEEP_NAMESPACE  L"SweepHelper.Sweeper"
-#define SWEEP_METHOD     L"Sweep"
-#define CLR_VERSION      L"v4.0.30319"
+#define SWEEP_CORE_DLL        L"sweep_core.dll"
+#define SWEEP_NAMESPACE       L"SweepHelper.Sweeper"
+#define SWEEP_METHOD_CCTORS   L"SweepCctors"    /* PASS 1: run <Module>.cctors */
+#define SWEEP_METHOD_FORCEJIT L"SweepForceJit"  /* PASS 2: PrepareMethod sweep */
+#define CLR_VERSION           L"v4.0.30319"
 
 static HINSTANCE g_self = NULL;
+
+/* ── Fault containment for the managed sweep ──────────────────────────────
+ * The force-JIT sweep runs managed code (cctors, PrepareMethod) on this
+ * injected worker thread.  On some ConfuserEx protections that faults with a
+ * hard, uncatchable native access violation (0xC0000005) which — left
+ * unhandled — kills the WHOLE target process, so its natural execution never
+ * finishes and almost nothing is captured.
+ *
+ * MinGW gcc has no MSVC __try/__except, so we contain such faults with a
+ * Vectored Exception Handler that longjmps back out of the offending call.
+ * It is registered LAST (FirstHandler = FALSE) so the CLR's own VEH — which
+ * turns genuine null derefs into managed NullReferenceExceptions — runs
+ * first; we only catch faults the CLR declined (truly fatal), and only on our
+ * sweep thread while a guarded call is in flight.
+ *
+ * Caveat: longjmp unwinds the native stack without running the CLR's frame
+ * handlers, so any cctor/JIT lock held at fault time stays held — the main
+ * thread could stall on a later cctor/JIT.  The upside is the process no
+ * longer dies, so natural execution (which already recovers the payload on
+ * these protections) can complete. */
+static DWORD         g_sweep_tid        = 0;   /* worker TID; 0 = no guard */
+static volatile LONG g_guard_armed      = 0;   /* 1 while inside a guarded call */
+static jmp_buf       g_guard_jmp;
+static DWORD         g_guard_fault_code = 0;
+
+static LONG CALLBACK sweep_fault_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (g_guard_armed &&
+        GetCurrentThreadId() == g_sweep_tid &&
+        (code == EXCEPTION_ACCESS_VIOLATION    ||
+         code == EXCEPTION_IN_PAGE_ERROR       ||
+         code == EXCEPTION_ILLEGAL_INSTRUCTION ||
+         code == EXCEPTION_PRIV_INSTRUCTION    ||
+         code == EXCEPTION_STACK_OVERFLOW)) {
+        g_guard_fault_code = code;
+        g_guard_armed = 0;           /* disarm before unwinding */
+        longjmp(g_guard_jmp, 1);     /* back to guarded_execute() setjmp */
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Invoke one managed entry point under fault containment.  Returns the
+ * HRESULT; on a contained hard fault sets *faulted = 1 and returns E_FAIL. */
+static HRESULT guarded_execute(ICLRRuntimeHost *host, LPCWSTR core_path,
+                               LPCWSTR method, DWORD *pret, int *faulted)
+{
+    *faulted = 0;
+    g_guard_fault_code = 0;
+    if (setjmp(g_guard_jmp) != 0) {
+        *faulted = 1;
+        hprintf("[SHIM] %ls FAULTED (contained) code=0x%08x\n",
+                method, (unsigned)g_guard_fault_code);
+        return E_FAIL;
+    }
+    g_guard_armed = 1;
+    HRESULT hr = host->lpVtbl->ExecuteInDefaultAppDomain(
+        host, core_path, SWEEP_NAMESPACE, method, L"", pret);
+    g_guard_armed = 0;
+    return hr;
+}
 
 /* Attach to the running CLR and invoke the managed sweep once. */
 static void run_sweep_once(void)
@@ -208,11 +275,31 @@ static void run_sweep_once(void)
     hprintf("[SHIM] core_path exists=%d (attr=0x%08x), calling Execute...\n",
             attr != INVALID_FILE_ATTRIBUTES, (unsigned)attr);
 
-    DWORD ret = 0;
-    hr = host->lpVtbl->ExecuteInDefaultAppDomain(host, core_path,
-        SWEEP_NAMESPACE, SWEEP_METHOD, L"", &ret);
-    hprintf("[SHIM] ExecuteInDefaultAppDomain hr=0x%08x ret=%u\n",
-            (unsigned)hr, (unsigned)ret);
+    /* Two fault-contained passes: cctors first (installs ConfuserEx's
+     * decryptor / JIT hook), then the PrepareMethod force-JIT.  Each is
+     * guarded independently so (a) a fatal fault is contained instead of
+     * killing the process, and (b) the [SHIM] log localises which pass
+     * faulted. */
+    g_sweep_tid = GetCurrentThreadId();
+    PVOID veh = AddVectoredExceptionHandler(0 /* last: after CLR's VEH */,
+                                            sweep_fault_veh);
+
+    DWORD ret1 = 0, ret2 = 0;
+    int   f1 = 0, f2 = 0;
+
+    HRESULT hr1 = guarded_execute(host, core_path,
+                                  SWEEP_METHOD_CCTORS, &ret1, &f1);
+    hprintf("[SHIM] SweepCctors hr=0x%08x ret=%u faulted=%d\n",
+            (unsigned)hr1, (unsigned)ret1, f1);
+
+    HRESULT hr2 = guarded_execute(host, core_path,
+                                  SWEEP_METHOD_FORCEJIT, &ret2, &f2);
+    hprintf("[SHIM] SweepForceJit hr=0x%08x ret=%u faulted=%d\n",
+            (unsigned)hr2, (unsigned)ret2, f2);
+
+    if (veh) RemoveVectoredExceptionHandler(veh);
+    g_guard_armed = 0;
+    g_sweep_tid   = 0;
 
 out_host:
     if (host) host->lpVtbl->Release(host);

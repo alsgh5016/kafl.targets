@@ -1041,8 +1041,9 @@ static BOOL detect_process_is_64bit(HANDLE hProcess) {
  * Looks for sweep_helper.dll in the same directory as this harness executable,
  * then injects it into the target via a remote LoadLibraryA thread.  The DLL's
  * DllMain calls ICLRRuntimeHost::ExecuteInDefaultAppDomain to invoke
- * SweepHelper.Sweeper.Sweep(""), which calls RuntimeHelpers.PrepareMethod on
- * every non-system, non-generic method already loaded in the target AppDomain.
+ * SweepHelper.Sweeper.SweepCctors("") then SweepForceJit(""): the first runs
+ * each module's <Module>.cctor, the second calls RuntimeHelpers.PrepareMethod
+ * on every non-system, non-generic method already loaded in the target AppDomain.
  *
  * This ensures that packed .NET code that has been JIT-compiled by the packer
  * before our WtE window starts is still captured: PrepareMethod re-triggers
@@ -1456,11 +1457,8 @@ int main(int argc, char** argv) {
             last_sweep_window = win;
             if (!sweep_triggered) {
                 sweep_triggered = TRUE;
-                /* CONTROL RUN: force-JIT sweep disabled to isolate whether the
-                 * crash comes from our sweep or the protection itself. */
-                hprintf("[+] JIT sweep DISABLED (control run) — idle window %u\n", win);
-                /* hprintf("[+] Triggering JIT sweep (idle-driven, window %u)\n", win);
-                   inject_jit_sweep(pi.hProcess, pi.hThread); */
+                hprintf("[+] Triggering JIT sweep (idle-driven, window %u)\n", win);
+                inject_jit_sweep(pi.hProcess, pi.hThread);
             }
         }
         /* NOTE: Dynamic IP range update disabled mid-fuzz.
@@ -1479,12 +1477,9 @@ int main(int argc, char** argv) {
             if (!sweep_triggered && sweep_trigger_ms > 0 &&
                 elapsed >= sweep_trigger_ms) {
                 sweep_triggered = TRUE;
-                /* CONTROL RUN: force-JIT sweep disabled (see idle-driven path). */
-                hprintf("[+] JIT sweep DISABLED (control run) — %lums elapsed\n",
+                hprintf("[+] Triggering JIT sweep at %lums (60%% of timeout)\n",
                         (unsigned long)elapsed);
-                /* hprintf("[+] Triggering JIT sweep at %lums (60%% of timeout)\n",
-                           (unsigned long)elapsed);
-                   inject_jit_sweep(pi.hProcess, pi.hThread); */
+                inject_jit_sweep(pi.hProcess, pi.hThread);
             }
 
             if (elapsed >= g_timeout_ms) {
