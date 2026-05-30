@@ -1102,14 +1102,31 @@ static void inject_jit_sweep(HANDLE hProcess, HANDLE hThread) {
         return;
     }
 
-    /* --- 4. Get LoadLibraryA address from this process (same across
-     *         all processes in a boot session on x64 Windows) --- */
-    LPTHREAD_START_ROUTINE load_lib =
-        (LPTHREAD_START_ROUTINE)GetProcAddress(
+    /* --- 4. Resolve LoadLibraryA in the TARGET's bitness ---
+     * The harness is 64-bit.  For a 64-bit target, kernel32!LoadLibraryA is
+     * shared (same base across same-bitness processes in a boot session) so
+     * our own GetProcAddress is correct.  For a 32-bit (WOW64) target it is
+     * NOT — the 32-bit kernel32 in SysWOW64 lives at a different address, so
+     * we must resolve the target's own 32-bit kernel32!LoadLibraryA.  Passing
+     * our 64-bit address to a 32-bit CreateRemoteThread is what made the
+     * earlier inject return LoadLibrary=0x0. */
+    LPTHREAD_START_ROUTINE load_lib = NULL;
+    if (g_target.is_64bit) {
+        load_lib = (LPTHREAD_START_ROUTINE)GetProcAddress(
             GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
+    } else {
+        DWORD k32_32 = find_module_base_32(hProcess, g_target.pid,
+                                           "kernel32.dll");
+        DWORD lla_32 = k32_32
+            ? find_export_in_remote_32(hProcess, k32_32, "LoadLibraryA")
+            : 0;
+        load_lib = (LPTHREAD_START_ROUTINE)(UINT_PTR)lla_32;
+        hprintf("[+] JIT sweep: 32-bit kernel32=0x%08x LoadLibraryA=0x%08x\n",
+                (unsigned)k32_32, (unsigned)lla_32);
+    }
     if (!load_lib) {
-        hprintf("[-] JIT sweep: GetProcAddress(LoadLibraryA) failed (0x%X)\n",
-                (unsigned)GetLastError());
+        hprintf("[-] JIT sweep: could not resolve LoadLibraryA (%s target)\n",
+                g_target.is_64bit ? "64-bit" : "32-bit");
         VirtualFreeEx(hProcess, remote_path, 0, MEM_RELEASE);
         return;
     }
