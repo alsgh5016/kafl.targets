@@ -153,6 +153,10 @@ static void run_sweep_once(void)
     lstrcpynW(core_path + lstrlenW(core_path), SWEEP_CORE_DLL,
               MAX_PATH - lstrlenW(core_path));
 
+    DWORD attr = GetFileAttributesW(core_path);
+    hprintf("[SHIM] core_path exists=%d (attr=0x%08x), calling Execute...\n",
+            attr != INVALID_FILE_ATTRIBUTES, (unsigned)attr);
+
     DWORD ret = 0;
     hr = host->lpVtbl->ExecuteInDefaultAppDomain(host, core_path,
         SWEEP_NAMESPACE, SWEEP_METHOD, L"", &ret);
