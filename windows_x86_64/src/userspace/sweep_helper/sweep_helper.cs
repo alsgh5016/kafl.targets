@@ -20,6 +20,7 @@
  */
 
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
@@ -44,26 +45,61 @@ namespace SweepHelper
         {
             int count = 0;
 
+            // Collect the target application's own assemblies (skip dynamic
+            // and framework/GAC assemblies).  We force-JIT only these.
+            var targetAsms = new List<Assembly>();
             foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                // Skip dynamic assemblies — they have no on-disk IL to prepare.
+                // Dynamic assemblies have no on-disk IL to prepare.
                 if (asm.IsDynamic)
                     continue;
+                if (IsSystemAssembly(asm))
+                    continue;
+                targetAsms.Add(asm);
+            }
 
-                // Skip well-known system assemblies.  We only want the target
-                // application's own assemblies (those NOT in the GAC and NOT
-                // part of the framework).
-                string name = asm.GetName().Name ?? string.Empty;
-                if (name.StartsWith("mscorlib",       StringComparison.OrdinalIgnoreCase) ||
-                    name.StartsWith("System",          StringComparison.OrdinalIgnoreCase) ||
-                    name.StartsWith("Microsoft",       StringComparison.OrdinalIgnoreCase) ||
-                    name.StartsWith("PresentationCore", StringComparison.OrdinalIgnoreCase) ||
-                    name.StartsWith("PresentationFramework", StringComparison.OrdinalIgnoreCase) ||
-                    name.StartsWith("WindowsBase",     StringComparison.OrdinalIgnoreCase))
+            // PASS 1 — run every module's static constructor (<Module>.cctor)
+            // BEFORE any force-JIT.  ConfuserEx (anti-tamper / constant /
+            // anti-ildump and the shared runtime init) installs its IL-
+            // decryption / JIT hook in the module initializer.  Force-JITing a
+            // method before that init has run makes the JIT compile still-
+            // encrypted IL, faulting with an UNCATCHABLE native access
+            // violation (0xC0000005) that kills the entire process.  Running
+            // the module cctor first ensures bodies are decrypted / the hook is
+            // installed.  RunModuleConstructor is idempotent — a no-op if the
+            // cctor already ran.
+            foreach (Assembly asm in targetAsms)
+            {
+                Module[] modules;
+                try
+                {
+                    modules = asm.GetModules();
+                }
+                catch
                 {
                     continue;
                 }
 
+                foreach (Module mod in modules)
+                {
+                    if (mod == null)
+                        continue;
+                    try
+                    {
+                        RuntimeHelpers.RunModuleConstructor(mod.ModuleHandle);
+                    }
+                    catch
+                    {
+                        // A throwing decryptor cctor is non-fatal; other
+                        // modules and the force-JIT pass below may still run.
+                    }
+                }
+            }
+
+            // PASS 2 — force-JIT every concrete, non-generic method/ctor so WtE
+            // detection sees all unpacked .NET code as executed memory.
+            foreach (Assembly asm in targetAsms)
+            {
                 // GetTypes() can throw ReflectionTypeLoadException when some
                 // types fail to load (e.g. missing dependencies).  Recover
                 // the partial type list from the exception.
@@ -92,13 +128,20 @@ namespace SweepHelper
                     if (t.IsGenericTypeDefinition)
                         continue;
 
-                    MethodBase[] methods;
+                    const BindingFlags memberFlags =
+                        BindingFlags.Public    | BindingFlags.NonPublic |
+                        BindingFlags.Instance  | BindingFlags.Static    |
+                        BindingFlags.DeclaredOnly;
+
+                    // GetMethods() does NOT return constructors — instance
+                    // (.ctor) and static (.cctor) ctors must be fetched
+                    // separately via GetConstructors(), or they never get
+                    // force-JITed (and stay absent from the heap capture when
+                    // the program itself never invokes them).
+                    var targets = new List<MethodBase>();
                     try
                     {
-                        methods = t.GetMethods(
-                            BindingFlags.Public    | BindingFlags.NonPublic |
-                            BindingFlags.Instance  | BindingFlags.Static    |
-                            BindingFlags.DeclaredOnly);
+                        targets.AddRange(t.GetMethods(memberFlags));
                     }
                     catch
                     {
@@ -106,8 +149,16 @@ namespace SweepHelper
                         // to enumerate their members — skip silently.
                         continue;
                     }
+                    try
+                    {
+                        targets.AddRange(t.GetConstructors(memberFlags));
+                    }
+                    catch
+                    {
+                        // Ctor enumeration failure is non-fatal; keep methods.
+                    }
 
-                    foreach (MethodBase m in methods)
+                    foreach (MethodBase m in targets)
                     {
                         if (m == null)
                             continue;
@@ -136,6 +187,22 @@ namespace SweepHelper
             }
 
             return count;
+        }
+
+        /// <summary>
+        /// True for framework / GAC assemblies we never want to force-JIT —
+        /// only the target application's own assemblies are swept.
+        /// </summary>
+        private static bool IsSystemAssembly(Assembly asm)
+        {
+            string name = asm.GetName().Name ?? string.Empty;
+            return
+                name.StartsWith("mscorlib",              StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("System",                StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("Microsoft",             StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("PresentationCore",      StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("PresentationFramework", StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("WindowsBase",           StringComparison.OrdinalIgnoreCase);
         }
     }
 }
