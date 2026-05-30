@@ -42,6 +42,17 @@
 typedef struct ICLRMetaHost    ICLRMetaHost;
 typedef struct ICLRRuntimeInfo ICLRRuntimeInfo;
 typedef struct ICLRRuntimeHost ICLRRuntimeHost;
+typedef struct IEnumUnknown     IEnumUnknown;
+
+typedef struct IEnumUnknownVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IEnumUnknown *, REFIID, void **);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(IEnumUnknown *);
+    ULONG   (STDMETHODCALLTYPE *Release)(IEnumUnknown *);
+    /* slot 3 */
+    HRESULT (STDMETHODCALLTYPE *Next)(IEnumUnknown *, ULONG celt,
+                                      void **rgelt, ULONG *pceltFetched);
+} IEnumUnknownVtbl;
+struct IEnumUnknown { const IEnumUnknownVtbl *lpVtbl; };
 
 typedef struct ICLRMetaHostVtbl {
     HRESULT (STDMETHODCALLTYPE *QueryInterface)(ICLRMetaHost *, REFIID, void **);
@@ -49,6 +60,11 @@ typedef struct ICLRMetaHostVtbl {
     ULONG   (STDMETHODCALLTYPE *Release)(ICLRMetaHost *);
     /* slot 3 */
     HRESULT (STDMETHODCALLTYPE *GetRuntime)(ICLRMetaHost *, LPCWSTR, REFIID, void **);
+    void *GetVersionFromFile;          /* slot 4 */
+    void *EnumerateInstalledRuntimes;  /* slot 5 */
+    /* slot 6 */
+    HRESULT (STDMETHODCALLTYPE *EnumerateLoadedRuntimes)(
+        ICLRMetaHost *, HANDLE hndProcess, IEnumUnknown **ppEnumerator);
 } ICLRMetaHostVtbl;
 struct ICLRMetaHost { const ICLRMetaHostVtbl *lpVtbl; };
 
@@ -56,7 +72,10 @@ typedef struct ICLRRuntimeInfoVtbl {
     HRESULT (STDMETHODCALLTYPE *QueryInterface)(ICLRRuntimeInfo *, REFIID, void **);
     ULONG   (STDMETHODCALLTYPE *AddRef)(ICLRRuntimeInfo *);
     ULONG   (STDMETHODCALLTYPE *Release)(ICLRRuntimeInfo *);
-    void *GetVersionString;       /* slot 3  */
+    /* slot 3 */
+    HRESULT (STDMETHODCALLTYPE *GetVersionString)(ICLRRuntimeInfo *,
+                                                  LPWSTR pwzBuffer,
+                                                  DWORD *pcchBuffer);
     void *GetRuntimeDirectory;    /* slot 4  */
     void *IsLoaded;               /* slot 5  */
     void *LoadErrorString;        /* slot 6  */
@@ -129,19 +148,51 @@ static void run_sweep_once(void)
             (unsigned)hr, (unsigned)(UINT_PTR)meta);
     if (FAILED(hr) || !meta) return;
 
-    hr = meta->lpVtbl->GetRuntime(meta, CLR_VERSION,
-                                  &kIID_ICLRRuntimeInfo, (void **)&info);
-    hprintf("[SHIM] GetRuntime hr=0x%08x info=0x%08x\n",
-            (unsigned)hr, (unsigned)(UINT_PTR)info);
-    if (FAILED(hr) || !info) goto out_meta;
+    /* Attach to whatever CLR the target ACTUALLY loaded (v2 vs v4) instead of
+     * hardcoding a version — a v4 host on a v2 target would mis-resolve the
+     * default AppDomain.  Enumerate loaded runtimes and take the first that
+     * yields an ICLRRuntimeHost. */
+    IEnumUnknown *pEnum = NULL;
+    hr = meta->lpVtbl->EnumerateLoadedRuntimes(meta, GetCurrentProcess(),
+                                               &pEnum);
+    hprintf("[SHIM] EnumerateLoadedRuntimes hr=0x%08x enum=0x%08x\n",
+            (unsigned)hr, (unsigned)(UINT_PTR)pEnum);
+    if (SUCCEEDED(hr) && pEnum) {
+        ICLRRuntimeInfo *ri = NULL;
+        ULONG fetched = 0;
+        while (pEnum->lpVtbl->Next(pEnum, 1, (void **)&ri, &fetched) == S_OK
+               && fetched == 1 && ri) {
+            wchar_t ver[64];
+            DWORD vlen = 64;
+            ver[0] = L'\0';
+            ri->lpVtbl->GetVersionString(ri, ver, &vlen);
+            ICLRRuntimeHost *h = NULL;
+            HRESULT gi = ri->lpVtbl->GetInterface(ri, &kCLSID_CLRRuntimeHost,
+                                                  &kIID_ICLRRuntimeHost,
+                                                  (void **)&h);
+            hprintf("[SHIM] loaded runtime ver=%ls GetInterface hr=0x%08x "
+                    "host=0x%08x\n", ver, (unsigned)gi, (unsigned)(UINT_PTR)h);
+            if (SUCCEEDED(gi) && h) { info = ri; host = h; break; }
+            ri->lpVtbl->Release(ri);
+            ri = NULL;
+        }
+        pEnum->lpVtbl->Release(pEnum);
+    }
 
-    /* The target already started the CLR; GetInterface hands us the live
-     * host without re-initialising it. */
-    hr = info->lpVtbl->GetInterface(info, &kCLSID_CLRRuntimeHost,
-                                    &kIID_ICLRRuntimeHost, (void **)&host);
-    hprintf("[SHIM] GetInterface hr=0x%08x host=0x%08x\n",
-            (unsigned)hr, (unsigned)(UINT_PTR)host);
-    if (FAILED(hr) || !host) goto out_info;
+    /* Fallback: nothing enumerated (or pre-v4 metahost) — try v4 directly. */
+    if (!host) {
+        hprintf("[SHIM] enum found no host, fallback GetRuntime %ls\n",
+                CLR_VERSION);
+        hr = meta->lpVtbl->GetRuntime(meta, CLR_VERSION,
+                                      &kIID_ICLRRuntimeInfo, (void **)&info);
+        if (SUCCEEDED(hr) && info) {
+            hr = info->lpVtbl->GetInterface(info, &kCLSID_CLRRuntimeHost,
+                                            &kIID_ICLRRuntimeHost,
+                                            (void **)&host);
+        }
+        hprintf("[SHIM] fallback host=0x%08x\n", (unsigned)(UINT_PTR)host);
+    }
+    if (!host) goto out_info;
 
     /* Build <dir-of-this-shim>\sweep_core.dll. */
     wchar_t core_path[MAX_PATH];
@@ -164,11 +215,11 @@ static void run_sweep_once(void)
             (unsigned)hr, (unsigned)ret);
 
 out_host:
-    host->lpVtbl->Release(host);
+    if (host) host->lpVtbl->Release(host);
 out_info:
-    info->lpVtbl->Release(info);
+    if (info) info->lpVtbl->Release(info);
 out_meta:
-    meta->lpVtbl->Release(meta);
+    if (meta) meta->lpVtbl->Release(meta);
     hprintf("[SHIM] done\n");
 }
 
