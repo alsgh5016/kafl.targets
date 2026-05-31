@@ -1437,6 +1437,15 @@ int main(int argc, char** argv) {
                              ? (DWORD)(g_timeout_ms * 0.6)
                              : 0 /* disabled when timeout is infinite */;
     uint32_t last_sweep_window = 0;  /* last idle-window value seen from QEMU */
+    /* JIT-idle stabilisation.  QEMU bumps g_sweep_window each time the JIT has
+     * been quiet for its idle threshold (~500ms).  Firing on the FIRST window
+     * raced with the still-initialising main thread — more windows kept
+     * arriving (2,3,4,...) and the concurrent cctor/JIT faulted the target on
+     * a thread our containment guard cannot catch.  Instead, wait until the
+     * window count STOPS advancing for SWEEP_STABLE_MS (JIT truly settled):
+     * then RunModuleConstructor is a no-op and force-JIT runs on settled code. */
+    const DWORD SWEEP_STABLE_MS = 3000;
+    DWORD last_window_tick = 0;  /* GetTickCount at most recent window change */
 
     while (1) {
         wait_result = WaitForSingleObject(pi.hProcess, poll_interval_ms);
@@ -1447,19 +1456,24 @@ int main(int argc, char** argv) {
             break;
         }
 
-        /* Force-JIT sweep trigger: QEMU writes the JIT-idle window counter
-         * into g_sweep_window when the JIT goes quiet.  Prefer this over the
-         * 60%% timer — it fires right when loading has stabilised. */
+        /* Track the JIT-idle window counter; each change restarts the settle
+         * timer because the JIT just went active→quiet again. */
         uint32_t win = g_sweep_window;
         if (win != last_sweep_window) {
             hprintf("[+] Sweep signal: JIT idle window %u (prev %u)\n",
                     win, last_sweep_window);
             last_sweep_window = win;
-            if (!sweep_triggered) {
-                sweep_triggered = TRUE;
-                hprintf("[+] Triggering JIT sweep (idle-driven, window %u)\n", win);
-                inject_jit_sweep(pi.hProcess, pi.hThread);
-            }
+            last_window_tick  = GetTickCount();
+        }
+
+        /* Fire once idle-stable: at least one window seen AND no new window
+         * for SWEEP_STABLE_MS. */
+        if (!sweep_triggered && last_sweep_window > 0 &&
+            (GetTickCount() - last_window_tick) >= SWEEP_STABLE_MS) {
+            sweep_triggered = TRUE;
+            hprintf("[+] Triggering JIT sweep (stable idle: window %u, +%lums)\n",
+                    last_sweep_window, (unsigned long)SWEEP_STABLE_MS);
+            inject_jit_sweep(pi.hProcess, pi.hThread);
         }
         /* NOTE: Dynamic IP range update disabled mid-fuzz.
          * HYPERCALL_KAFL_RANGE_SUBMIT is blocked after ACQUIRE by
