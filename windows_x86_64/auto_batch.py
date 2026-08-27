@@ -29,17 +29,21 @@ EXIT_CODE_HOST_DEGRADED = 2
 # exits with EXIT_CODE_HOST_DEGRADED — typically after ~5-10 successful
 # samples when KVM module state accumulates and new QEMU launches abort
 # right after 'Booting VM to start fuzzing...' (Broken Pipe at handshake).
+KVM_MODULE_DIR = (
+    Path(__file__).resolve().parent / "../../kafl.linux/arch/x86/kvm"
+).resolve()
+
 HOST_RECOVERY_SEQUENCE = [
-    (["systemctl", "stop", "libvirtd"], "stop libvirtd"),
-    (["pkill", "-9", "-f", "qemu-system-x86_64"], "kill stragglers"),
-    (["sleep", "2"], "settle"),
-    (["modprobe", "-r", "kvm_intel"], "unload kvm_intel"),
-    (["modprobe", "-r", "kvm"], "unload kvm"),
-    (["sleep", "1"], "settle"),
-    (["modprobe", "kvm"], "load kvm"),
-    (["modprobe", "kvm_intel"], "load kvm_intel"),
-    (["systemctl", "start", "libvirtd"], "start libvirtd"),
-    (["sleep", "5"], "wait for libvirtd"),
+    (["systemctl", "stop", "libvirtd"], "stop libvirtd", False),
+    (["pkill", "-9", "-f", "qemu-system-x86_64"], "kill stragglers", False),
+    (["sleep", "2"], "settle", False),
+    (["modprobe", "-r", "kvm_intel"], "unload kvm_intel", False),
+    (["modprobe", "-r", "kvm"], "unload kvm", False),
+    (["sleep", "1"], "settle", False),
+    (["insmod", str(KVM_MODULE_DIR / "kvm.ko")], "load kvm", False),
+    (["insmod", str(KVM_MODULE_DIR / "kvm-intel.ko")], "load kvm_intel", False),
+    (["systemctl", "start", "libvirtd"], "start libvirtd", True),
+    (["sleep", "5"], "wait for libvirtd", True),
 ]
 
 
@@ -134,25 +138,26 @@ def recover_host() -> bool:
     print(f"\n{'#'*60}")
     print(f"[auto_batch] HOST RECOVERY (KVM module reload)")
     print(f"{'#'*60}")
-    for cmd, label in HOST_RECOVERY_SEQUENCE:
+    recovery_failed = False
+    for cmd, label, always_run in HOST_RECOVERY_SEQUENCE:
+        if recovery_failed and not always_run:
+            continue
         print(f"[auto_batch] recover: {label} -> $ {' '.join(cmd)}")
-        # `sleep` is best-effort; failures here are just timing.
         if cmd[0] == "sleep":
-            try:
-                time.sleep(int(cmd[1]))
-            except Exception:
-                pass
+            time.sleep(int(cmd[1]))
             continue
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            # pkill failures are expected when no matching process exists
             if cmd[0] == "pkill":
                 continue
             print(f"[auto_batch] recover: {label} FAILED rc={result.returncode}")
             if result.stderr:
                 for line in result.stderr.strip().splitlines()[:5]:
                     print(f"[auto_batch]   stderr: {line}")
-            return False
+            recovery_failed = True
+
+    if recovery_failed:
+        return False
     print(f"[auto_batch] HOST RECOVERY complete\n")
     return True
 
