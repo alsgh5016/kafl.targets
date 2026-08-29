@@ -24,6 +24,26 @@
     - name: Disable hibernation and Fast Startup (kAFL CPU-model parity)
       win_command: powercfg /hibernate off
 
+    # Disable Windows Defender so it does not block execution of the packed
+    # malware sample.  Without this, CreateProcess of a flagged sample fails
+    # with Win32 error 0xE1 (ERROR_VIRUS_INFECTED) and the harness aborts with
+    # "Failed to create target process" (and Defender may also delete the
+    # uploaded sample outright).  Tamper Protection is OFF on the box, so the
+    # preference/exclusion/policy below take effect.  Runs BEFORE the sample is
+    # uploaded; the ExclusionPath + DisableAntiSpyware policy persist across the
+    # subsequent cold boot that `kafl fuzz` performs, so the sample can launch.
+    - name: Disable Windows Defender (malware sandbox)
+      win_shell: |
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableScriptScanning $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
+        Add-MpPreference -ExclusionPath 'C:\Users\vagrant\Desktop' -ErrorAction SilentlyContinue
+        Add-MpPreference -ExclusionExtension 'exe' -ErrorAction SilentlyContinue
+        New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Force | Out-Null
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Name DisableAntiSpyware -Value 1 -Type DWord -ErrorAction SilentlyContinue
+      failed_when: false
+
     - name: Upload binaries
       win_copy:
         src: "{{ bin_src | default('bin') }}"
