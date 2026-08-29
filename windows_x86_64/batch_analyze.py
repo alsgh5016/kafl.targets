@@ -115,6 +115,24 @@ Vagrant.configure("2") do |config|
         libvirt.memory = 4096
     end
 
+    # Disable Windows hibernation/Fast Startup right after boot, BEFORE the
+    # ready_provision snapshot in _init_worker_vm, so no hiberfil.sys is ever
+    # written and every derived VM cold-boots.  Otherwise Fast Startup saves
+    # the running CR4/CPU state under this provisioning CPU model and restores
+    # it on the next boot under the kAFL64-Hypervisor model `kafl fuzz` uses;
+    # the mismatch either re-enables CR4.SMAP/UMIP that kAFL64 lacks (#GP ->
+    # triple-fault -> Broken pipe at the Nyx handshake) or hangs the guest at
+    # the boot splash.  run_remote runs a single WinRM command and does NOT
+    # trigger the ansible provisioner (contrast config.vm.provision), so the
+    # snapshot is still taken promptly (Windows Defender has no time to
+    # re-enable and delete uploaded samples).  on_error :continue keeps a
+    # transient WinRM hiccup from failing worker setup.
+    config.trigger.after :up do |trigger|
+        trigger.info = "Disable hibernation/Fast Startup"
+        trigger.run_remote = {inline: "powercfg /hibernate off"}
+        trigger.on_error = :continue
+    end
+
     config.trigger.after :provision do |trigger|
         trigger.info = "Provisioning worker #{WORKER_ID}"
         trigger.run = {inline: "bash -c 'source #{ROOT_DIR}/venv/bin/activate && cd #{WORKER_DIR} && #{PROJECT_DIR}/setup_target.sh -e target_harness=#{TARGET} -e bin_src=#{WORKER_DIR}/bin'"}

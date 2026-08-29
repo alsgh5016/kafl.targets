@@ -34,6 +34,20 @@ Vagrant.configure("2") do |config|
         libvirt.memory = 4096
     end
 
+    # Disable Windows hibernation/Fast Startup right after boot so no
+    # hiberfil.sys is ever written and the VM cold-boots under kAFL64.  Fast
+    # Startup would otherwise save CR4/CPU state under this provisioning CPU
+    # model and restore it on the next boot under the kAFL64 model `kafl fuzz`
+    # uses, causing a #GP triple-fault (Broken pipe at the Nyx handshake) or a
+    # boot-splash hang.  run_remote runs a single WinRM command and does NOT
+    # trigger the ansible provisioner; on_error :continue tolerates a WinRM
+    # hiccup.
+    config.trigger.after :up do |trigger|
+        trigger.info = "Disable hibernation/Fast Startup"
+        trigger.run_remote = {inline: "powercfg /hibernate off"}
+        trigger.on_error = :continue
+    end
+
     # workaround https://github.com/hashicorp/vagrant/issues/13193
     config.trigger.after :provision do |trigger|
         trigger.info = "Provisioning"

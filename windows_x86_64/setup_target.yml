@@ -12,6 +12,18 @@
         target_harness: 'userspace'
       when: target_harness is undefined
 
+    # Disable hibernation + Fast Startup so `vagrant halt` performs a FULL
+    # shutdown (no hiberfil.sys).  Otherwise Windows Fast Startup saves the
+    # running kernel/CPU state (incl. CR4) under the provisioning CPU model
+    # and, on the next boot under the kAFL64-Hypervisor model that `kafl
+    # fuzz` uses, restores that state onto a CPU with a different feature
+    # set.  The mismatch either sets CR4.SMAP/UMIP that kAFL64 lacks -> #GP
+    # -> triple-fault (Broken pipe at the Nyx handshake) or hangs the guest
+    # at the boot splash.  A full cold boot re-reads the kAFL64 CPUID and
+    # configures CR4/features correctly, so the harness reaches WTE_SETUP.
+    - name: Disable hibernation and Fast Startup (kAFL CPU-model parity)
+      win_command: powercfg /hibernate off
+
     - name: Upload binaries
       win_copy:
         src: "{{ bin_src | default('bin') }}"
