@@ -8,7 +8,17 @@
 # It is read-only: it never kills processes or touches modules.
 set -u
 WORKROOT="${1:-}"
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # ~/kUnpack/kafl -> ~/kUnpack
+# Repo root: dir containing kafl.linux/ (server layout: ~/kUnpack/kafl/{kafl.linux,qemu,examples})
+REPO_ROOT="${REPO_ROOT:-}"
+if [ -z "$REPO_ROOT" ]; then
+  for c in "$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)" "$HOME/kUnpack/kafl" "$HOME/kUnpack"; do
+    [ -d "$c/kafl.linux" ] && REPO_ROOT="$c" && break
+  done
+fi
+# Default log root: directory of the most recently modified batch_analyze.log
+if [ -z "$WORKROOT" ]; then
+  WORKROOT="$(dirname "$(find /hdd /root /home -maxdepth 4 -name batch_analyze.log -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)" 2>/dev/null)"
+fi
 
 section() { printf '\n===== %s =====\n' "$*"; }
 
@@ -16,7 +26,7 @@ section "host"
 hostname; date; uname -r; uptime
 
 section "repo heads (what is deployed)"
-for r in kafl.linux kafl.qemu kafl.targets; do
+for r in kafl.linux kafl.qemu qemu kafl.targets examples; do
   d="$REPO_ROOT/$r"
   [ -d "$d/.git" ] && printf '%-14s %s\n' "$r" "$(git -C "$d" log -1 --format='%h %ad %s' --date=short)"
 done
@@ -68,7 +78,8 @@ virsh list --all 2>/dev/null | head
 
 section "kafl logs: last error lines"
 if [ -n "$WORKROOT" ] && [ -d "$WORKROOT" ]; then
-  for f in $(find "$WORKROOT" -maxdepth 3 \( -name 'qemu_stderr.log' -o -name 'hprintf_*.log' -o -name 'serial_*.log' -o -name 'batch_analyze.log' \) -mmin -720 2>/dev/null | head -20); do
+  echo "log root: $WORKROOT"
+  for f in $(find "$WORKROOT" -maxdepth 4 \( -name 'qemu_stderr.log' -o -name 'hprintf_*.log' -o -name 'serial_*.log' -o -name 'batch_analyze.log' \) -mmin -720 2>/dev/null | head -20); do
     echo "--- $f"; grep -nE 'ToPA|abort|Abort|Broken|Failed|failed|error|Error|assert|ioctl|Workers aborted' "$f" | tail -15
   done
 else
