@@ -447,8 +447,12 @@ def _init_worker_vm(worker_dir: Path) -> None:
         cwd=worker_dir, timeout=120,
         label="vagrant snapshot save",
     )
+    # snapshot save leaves the domain paused, so a graceful ACPI shutdown has
+    # nothing running to respond to it and vagrant halt blocks until the
+    # timeout, leaving a stale vagrant process holding the environment lock.
+    # The VM state is already captured in the snapshot, so power it off.
     _run_cmd(
-        ["vagrant", "halt"],
+        ["vagrant", "halt", "--force"],
         cwd=worker_dir, timeout=HALT_TIMEOUT,
         label="vagrant halt",
     )
