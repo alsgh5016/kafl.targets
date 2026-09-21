@@ -71,7 +71,10 @@ batch-status:
 # -- Fix expired vagrant/vagrant credentials in the base box --
 # The Windows guest expires passwords after 42 days by default.
 # Run this whenever `vagrant up` fails with WinRM authentication errors.
-BOX_IMG ?= $(HOME)/.vagrant.d/boxes/kafl_windows/0/libvirt/box_0.img
+# Packer-built boxes name the disk box_0.img; a hand-packaged one uses
+# box.img. Match whichever is present so this needs no override.
+BOX_DIR := $(HOME)/.vagrant.d/boxes/kafl_windows/0/libvirt
+BOX_IMG ?= $(firstword $(wildcard $(BOX_DIR)/box_0.img $(BOX_DIR)/box.img))
 
 fix-box:
 	sudo bash $(CUR_DIR)/fix_box_password.sh $(BOX_IMG)
