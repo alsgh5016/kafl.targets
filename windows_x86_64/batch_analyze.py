@@ -48,6 +48,7 @@ WORKERS_DIR = "workers"
 WORKERS_CONFIG = "workers.json"
 PROVISION_TIMEOUT = 300
 HALT_TIMEOUT = 120
+HALT_VERIFY_ATTEMPTS = 3
 SIGTERM_GRACE = 3
 MAX_CONSECUTIVE_FAILURES = 5
 HPRINTF_SUCCESS_MARKERS = [
@@ -455,6 +456,56 @@ def _init_worker_vm(worker_dir: Path) -> None:
         ["vagrant", "halt", "--force"],
         cwd=worker_dir, timeout=HALT_TIMEOUT,
         label="vagrant halt",
+    )
+    _ensure_domain_off(worker_dir)
+
+
+def _ensure_domain_off(worker_dir: Path) -> None:
+    """Wait for the worker's libvirt domain to actually power off.
+
+    vagrant halt --force returns before libvirt has necessarily torn the
+    domain down, and a snapshot save can leave it paused instead. A domain
+    that is not shut off keeps its QEMU alive holding the qcow2 open, which
+    makes QEMU-Nyx fail to open the image when the worker is later fuzzed.
+    """
+    worker_id = worker_dir.name.replace("worker", "")
+    domain_name = f"{worker_dir.name}_kafl-worker-{worker_id}"
+
+    for attempt in range(HALT_VERIFY_ATTEMPTS):
+        active = []
+        for conn in ["qemu:///session", "qemu:///system"]:
+            try:
+                result = subprocess.run(
+                    ["virsh", "-c", conn, "domstate", domain_name],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception as e:
+                logger.debug("virsh domstate failed for %s (%s): %s",
+                             domain_name, conn, e)
+                continue
+            if result.returncode != 0:
+                continue
+            if result.stdout.strip() not in ("shut off", ""):
+                active.append(conn)
+
+        if not active:
+            return
+
+        logger.warning("%s still active after halt (%d/%d), forcing off",
+                       domain_name, attempt + 1, HALT_VERIFY_ATTEMPTS)
+        for conn in active:
+            try:
+                subprocess.run(
+                    ["virsh", "-c", conn, "destroy", domain_name],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except Exception as e:
+                logger.debug("virsh destroy failed for %s (%s): %s",
+                             domain_name, conn, e)
+        time.sleep(2)
+
+    raise RuntimeError(
+        f"{domain_name} would not power off; its QEMU still holds the disk image"
     )
 
 
