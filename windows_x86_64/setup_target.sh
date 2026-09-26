@@ -14,10 +14,29 @@ ip_address=$(vagrant winrm-config 2>/dev/null | awk '/HostName/{print $2; exit}'
 if [ -z "$ip_address" ]; then
     id_file=$(ls .vagrant/machines/*/libvirt/id 2>/dev/null | head -1)
     if [ -n "$id_file" ]; then
-        mac=$(virsh -c qemu:///session domiflist "$(cat "$id_file")" 2>/dev/null \
-              | awk 'NR>2 && NF>=5 {print $5; exit}')
+        iflist=$(virsh -c qemu:///session domiflist "$(cat "$id_file")" 2>/dev/null)
+        mac=$(echo "$iflist" | awk 'NR>2 && NF>=5 {print $5; exit}')
+        bridge=$(echo "$iflist" | awk 'NR>2 && NF>=5 {print $3; exit}')
         if [ -n "$mac" ]; then
             ip_address=$(ip -4 neigh show | awk -v m="$mac" 'index($0, m) {print $1; exit}')
+
+            # The neighbour table only knows hosts this machine has talked to
+            # recently, which is not the case for a worker it has not reached
+            # yet. Probe the bridge subnet to populate it: Windows drops the
+            # inbound ICMP, but it still answers the ARP request that precedes
+            # it, and the resulting neighbour entry is all we need.
+            if [ -z "$ip_address" ] && [ -n "$bridge" ]; then
+                cidr=$(ip -4 -o addr show dev "$bridge" 2>/dev/null | awk '{print $4; exit}')
+                prefix=${cidr%/*}
+                prefix=${prefix%.*}
+                if [ -n "$prefix" ]; then
+                    for octet in $(seq 1 254); do
+                        ping -c1 -W1 "${prefix}.${octet}" >/dev/null 2>&1 &
+                    done
+                    wait
+                    ip_address=$(ip -4 neigh show | awk -v m="$mac" 'index($0, m) {print $1; exit}')
+                fi
+            fi
         fi
     fi
 fi
