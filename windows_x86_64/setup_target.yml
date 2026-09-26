@@ -44,6 +44,24 @@
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Name DisableAntiSpyware -Value 1 -Type DWord -ErrorAction SilentlyContinue
       failed_when: false
 
+    # Set-MpPreference returns before the engine has applied the change, so a
+    # sample uploaded right afterwards can still be quarantined on write with
+    # ERROR_VIRUS_INFECTED -- ansible reports the copy as changed, the file is
+    # gone, and the run burns a full kafl timeout with no harness output.
+    # Wait until the engine itself reports real-time protection is off.
+    - name: Wait for Defender real-time protection to actually be off
+      win_shell: |
+        $s = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        if ($null -eq $s) { exit 0 }
+        if ($s.RealTimeProtectionEnabled) { exit 1 }
+        exit 0
+      register: kafl_defender_off
+      until: kafl_defender_off.rc == 0
+      retries: 12
+      delay: 5
+      changed_when: false
+      failed_when: false
+
     - name: Upload binaries
       win_copy:
         src: "{{ bin_src | default('bin') }}"
@@ -78,6 +96,19 @@
             src: "{{ ansible_env.USERPROFILE }}\\Desktop\\bin\\userspace\\unpack_harness.exe"
             arguments: "{{ ansible_env.USERPROFILE }}\\Desktop\\bin\\userspace\\target_packed.exe 300000 0"
             dest: "{{ ansible_env.APPDATA }}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\kafl_target.lnk"
+
+        # Read the shortcut and the sample back. Provisioning that reports
+        # success while the guest ends up without them costs a full kafl
+        # timeout to discover, and leaves no trace of which step was skipped.
+        - name: Verify the harness autostart and sample landed on the guest
+          win_stat:
+            path: "{{ item }}"
+          register: kafl_provision_check
+          failed_when: not kafl_provision_check.stat.exists
+          loop:
+            - "{{ ansible_env.APPDATA }}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\kafl_target.lnk"
+            - "{{ ansible_env.USERPROFILE }}\\Desktop\\bin\\userspace\\unpack_harness.exe"
+            - "{{ ansible_env.USERPROFILE }}\\Desktop\\bin\\userspace\\target_packed.exe"
       when: target_harness == 'unpack'
 
     - name: Setup driver harness target
