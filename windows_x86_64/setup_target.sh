@@ -48,6 +48,11 @@ if [ -z "$ip_address" ]; then
     exit 1
 fi
 
+# Diagnostic: record which address each provisioning run actually used, so a
+# silent mis-target (stale neighbour entry, worker IP collision) is traceable.
+echo "$(date +%H:%M:%S) dir=$(basename "$PWD") ip=$ip_address mac=${mac:-lease}" \
+    >> /tmp/kafl_ip_resolution.log 2>/dev/null || true
+
 # WinRM lib doesn't honor no_proxy
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
 
