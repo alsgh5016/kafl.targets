@@ -48,17 +48,22 @@
     # sample uploaded right afterwards can still be quarantined on write with
     # ERROR_VIRUS_INFECTED -- ansible reports the copy as changed, the file is
     # gone, and the run burns a full kafl timeout with no harness output.
-    # Wait until the engine itself reports real-time protection is off.
-    - name: Wait for Defender real-time protection to actually be off
+    #
+    # Poll inside the guest rather than with ansible retries: every retry is a
+    # fresh WinRM round trip, so a 12 x 5s retry loop cost ~155s of wall clock
+    # per sample, and provisioning is serialized across all workers.
+    - name: Wait for the Defender exclusion to take effect
       win_shell: |
-        $s = Get-MpComputerStatus -ErrorAction SilentlyContinue
-        if ($null -eq $s) { exit 0 }
-        if ($s.RealTimeProtectionEnabled) { exit 1 }
-        exit 0
-      register: kafl_defender_off
-      until: kafl_defender_off.rc == 0
-      retries: 12
-      delay: 5
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline) {
+            $p = Get-MpPreference -ErrorAction SilentlyContinue
+            if ($null -eq $p) { break }
+            $s = Get-MpComputerStatus -ErrorAction SilentlyContinue
+            $excluded = $p.ExclusionPath -contains 'C:\Users\vagrant\Desktop'
+            $off = ($null -eq $s) -or (-not $s.RealTimeProtectionEnabled)
+            if ($excluded -or $off) { break }
+            Start-Sleep -Seconds 2
+        }
       changed_when: false
       failed_when: false
 
