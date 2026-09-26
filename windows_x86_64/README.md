@@ -11,6 +11,12 @@ WtE(Write-then-Execute) 탐지를 통해 패킹된 바이너리의 메모리 덤
 - **Cross compiler**: `x86_64-w64-mingw32-gcc` (mingw-w64)
 - **Python**: 3.9+ with venv
 - **Vagrant box**: `kafl_windows` (Packer로 사전 빌드 필요 — `templates/windows/` 참조)
+- **Cross compiler (32bit)**: `i686-w64-mingw32-gcc`, `mono-mcs` (sweep 헬퍼 빌드용)
+
+> **box 이미지는 git으로 전달되지 않는다.** 새 서버에 배포하거나 box를 다시 만들 때는
+> [OPERATIONS.md](OPERATIONS.md)의 box 이미지 요구사항을 먼저 적용한다. 특히 Windows
+> Defender의 Tamper Protection이 켜져 있으면 프로비저닝이 조용히 실패하고 처리율이
+> 절반으로 떨어진다.
 
 ```bash
 # 필수 패키지 (Ubuntu)
