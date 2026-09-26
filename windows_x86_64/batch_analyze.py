@@ -924,6 +924,77 @@ def _log_qemu_state(worker_id: int) -> None:
         )
 
 
+CORES_PER_WORKER = 2
+
+
+def _parse_cpu_list(spec: str) -> list[int]:
+    """Expand a sysfs cpu list ("0,32" or "0-3,8") into ids."""
+    ids = []
+    for part in spec.strip().split(","):
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            ids.extend(range(int(lo), int(hi) + 1))
+        else:
+            ids.append(int(part))
+    return ids
+
+
+def _physical_core_cpus() -> list[int]:
+    """One logical CPU per physical core, lowest id of each sibling group.
+
+    Pinning two workers onto the two threads of a single core halves both,
+    and the id layout differs per machine: siblings are listed as "0,32" on
+    a 32-core host but "1,11" on a 10-core one, and some machines pair
+    adjacent ids. Reading the sibling lists avoids assuming any of those.
+    """
+    base = Path("/sys/devices/system/cpu")
+    seen: set[int] = set()
+    cores: list[int] = []
+    try:
+        entries = sorted(
+            (e for e in base.glob("cpu[0-9]*") if e.is_dir()),
+            key=lambda e: int(e.name[3:]),
+        )
+    except OSError as exc:
+        logger.debug("cpu topology unreadable: %s", exc)
+        return []
+    for entry in entries:
+        try:
+            siblings = _parse_cpu_list(
+                (entry / "topology" / "thread_siblings_list").read_text()
+            )
+        except (OSError, ValueError):
+            continue
+        if not siblings:
+            continue
+        core = min(siblings)
+        if core in seen:
+            continue
+        seen.add(core)
+        cores.append(core)
+    return cores
+
+
+def _worker_taskset_prefix(worker_id: int) -> list[str]:
+    """taskset arguments giving this worker its own physical cores."""
+    cores = _physical_core_cpus()
+    if len(cores) < CORES_PER_WORKER:
+        logger.warning("Cannot determine physical cores; running unpinned")
+        return []
+
+    capacity = len(cores) // CORES_PER_WORKER
+    if worker_id >= capacity:
+        logger.warning(
+            "[W%d] only %d workers fit on %d physical cores; sharing with W%d",
+            worker_id, capacity, len(cores), worker_id % capacity,
+        )
+    base_index = (worker_id % capacity) * CORES_PER_WORKER
+    selected = cores[base_index:base_index + CORES_PER_WORKER]
+    return ["taskset", "-c", ",".join(str(c) for c in selected)]
+
+
 def _launch_kafl_once(
     cmd: list[str],
     taskset_prefix: list[str],
@@ -1004,13 +1075,9 @@ def run_kafl(
     cmd.extend(extra_args)
 
     # Pin each worker to dedicated physical cores to prevent Intel PT
-    # MSR contention.  Worker N uses cores [N*2, N*2+1] (2 cores each,
-    # matching the VM's vCPU count).  This ensures PT trace buffers and
-    # MSR state are never clobbered by another VM's context switch.
-    cores_per_worker = 2
-    cpu_start = worker.worker_id * cores_per_worker
-    cpu_end = cpu_start + cores_per_worker - 1
-    taskset_prefix = ["taskset", "-c", f"{cpu_start}-{cpu_end}"]
+    # MSR contention, so PT trace buffers and MSR state are never clobbered
+    # by another VM's context switch.
+    taskset_prefix = _worker_taskset_prefix(worker.worker_id)
 
     rc = -1
     stdout = ""
