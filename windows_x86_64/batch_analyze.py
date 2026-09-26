@@ -47,6 +47,7 @@ PE_EXTENSIONS = {".exe", ".dll", ".scr", ".sys"}
 WORKERS_DIR = "workers"
 WORKERS_CONFIG = "workers.json"
 PROVISION_TIMEOUT = 300
+PROVISION_ATTEMPTS = 2
 HALT_TIMEOUT = 120
 HALT_VERIFY_ATTEMPTS = 3
 SIGTERM_GRACE = 3
@@ -674,14 +675,34 @@ def provision_sample(worker: WorkerInfo, sample_path: Path) -> None:
             _force_vm_off(worker)
             time.sleep(3)
 
-    # Provision (ansible uploads bin/ and creates startup shortcut)
+    # Provision (ansible uploads bin/ and creates startup shortcut).
+    # Defender still quarantines some UPX-packed samples on write despite the
+    # exclusions the playbook sets, and it does so non-deterministically: a
+    # sample that loses its upload on one attempt goes through on the next.
+    # The playbook reads the files back, so this fails in ~70s rather than
+    # burning a 600s kafl timeout, which makes a retry worth its cost.
     env = {**os.environ, "TARGET_HARNESS": "unpack"}
-    _run_cmd(
-        ["vagrant", "provision"],
-        cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
-        label=f"W{worker.worker_id} provision",
-        env=env,
-    )
+    for attempt in range(1, PROVISION_ATTEMPTS + 1):
+        try:
+            _run_cmd(
+                ["vagrant", "provision"],
+                cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
+                label=f"W{worker.worker_id} provision",
+                env=env,
+            )
+            break
+        except subprocess.CalledProcessError:
+            if attempt == PROVISION_ATTEMPTS:
+                raise
+            logger.warning(
+                "[W%d] Provision failed (attempt %d/%d), restoring and retrying",
+                worker.worker_id, attempt, PROVISION_ATTEMPTS,
+            )
+            _run_cmd(
+                ["vagrant", "snapshot", "restore", "ready_provision"],
+                cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
+                label=f"W{worker.worker_id} snapshot restore",
+            )
 
     # Clean halt preserves disk state for QEMU-Nyx
     _halt_worker(worker)
