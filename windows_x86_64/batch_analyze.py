@@ -21,7 +21,6 @@ Usage:
 """
 
 import argparse
-import contextlib
 import enum
 import json
 import logging
@@ -642,22 +641,10 @@ def teardown_workers(project_dir: Path) -> None:
 # -- Worker Operations --
 
 
-def provision_sample(
-    worker: WorkerInfo,
-    sample_path: Path,
-    vagrant_lock: Optional[threading.Lock] = None,
-) -> None:
+def provision_sample(worker: WorkerInfo, sample_path: Path) -> None:
     """Provision a worker VM with a specific sample.
 
     Flow: copy PE -> snapshot restore -> ansible provision -> halt.
-
-    Only the libvirt-facing steps take vagrant_lock. The ansible run is a
-    WinRM conversation with this worker's own guest and shares nothing with
-    its siblings, but it is also the bulk of the work -- measured over one
-    batch, 92s of a 114s provision. Holding the lock across it capped the
-    number of workers that could be analysing at once to
-    analysis_time / provision_time regardless of how many were configured:
-    twelve workers behaved like four.
     """
     target = worker.worker_dir / "bin" / "userspace" / "target_packed.exe"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -666,18 +653,15 @@ def provision_sample(
         "[W%d] Copied %s -> target_packed.exe", worker.worker_id, sample_path.name
     )
 
-    lock = vagrant_lock if vagrant_lock else contextlib.nullcontext()
-
     # Restore snapshot (boots VM to clean state)
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
-            with lock:
-                _run_cmd(
-                    ["vagrant", "snapshot", "restore", "ready_provision"],
-                    cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
-                    label=f"W{worker.worker_id} snapshot restore",
-                )
+            _run_cmd(
+                ["vagrant", "snapshot", "restore", "ready_provision"],
+                cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
+                label=f"W{worker.worker_id} snapshot restore",
+            )
             break
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             if attempt == max_retries:
@@ -714,16 +698,14 @@ def provision_sample(
                 "[W%d] Provision failed (attempt %d/%d), restoring and retrying",
                 worker.worker_id, attempt, PROVISION_ATTEMPTS,
             )
-            with lock:
-                _run_cmd(
-                    ["vagrant", "snapshot", "restore", "ready_provision"],
-                    cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
-                    label=f"W{worker.worker_id} snapshot restore",
-                )
+            _run_cmd(
+                ["vagrant", "snapshot", "restore", "ready_provision"],
+                cwd=worker.worker_dir, timeout=PROVISION_TIMEOUT,
+                label=f"W{worker.worker_id} snapshot restore",
+            )
 
     # Clean halt preserves disk state for QEMU-Nyx
-    with lock:
-        _halt_worker(worker)
+    _halt_worker(worker)
 
 
 def _halt_worker(worker: WorkerInfo) -> None:
@@ -1475,11 +1457,14 @@ def process_sample(
         # Phase 0: Kill any stray QEMU from previous run on this worker
         _cleanup_kafl(workdir, worker)
 
-        # Phase 1: Provision worker VM with this sample.
-        # provision_sample takes the lock itself, around the libvirt calls
-        # only -- see there for why the ansible run stays outside it.
+        # Phase 1: Provision worker VM with this sample
+        # Serialize vagrant operations to avoid libvirt lock conflicts
         logger.info("[W%d] Provisioning: %s", worker.worker_id, sample_name)
-        provision_sample(worker, sample_path, vagrant_lock)
+        if vagrant_lock:
+            with vagrant_lock:
+                provision_sample(worker, sample_path)
+        else:
+            provision_sample(worker, sample_path)
 
         # Phase 2: Run kAFL analysis
         logger.info("[W%d] Analyzing: %s", worker.worker_id, sample_name)
